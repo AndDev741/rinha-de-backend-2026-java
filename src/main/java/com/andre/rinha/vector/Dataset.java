@@ -48,6 +48,19 @@ public final class Dataset {
     public boolean isFraud(int i) { return labels.get(i); }
 
     /**
+     * Build a Dataset directly from in-memory arrays. Used by tests (so they
+     * don't have to roundtrip 168 MB of binary) and potentially by v4+ when
+     * we'll have alternate dataset constructions.
+     */
+    public static Dataset fromArrays(float[] vectors, BitSet labels) {
+        if (vectors.length % DIMS != 0) {
+            throw new IllegalArgumentException("vectors.length must be a multiple of " + DIMS);
+        }
+        int count = vectors.length / DIMS;
+        return new Dataset(vectors, labels, count);
+    }
+
+    /**
      * Loads vectors.bin + labels.bin from a directory.
      *
      * @param dir directory containing vectors.bin and labels.bin

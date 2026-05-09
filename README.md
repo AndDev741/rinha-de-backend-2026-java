@@ -3,30 +3,37 @@
 > **🇬🇧 [English](#english) · 🇧🇷 [Português](#português)**
 
 > **Branch strategy:** each major step lives on its own branch (`v1`, `v2`,
-> `v3`, ...). The final submission lives on `main`. This branch is **`v2`** —
-> the realistic-constraints stack: Docker Compose, nginx LB, two API replicas,
-> with the rinha CPU/memory budget.
+> `v3`, ...). The final submission lives on `main`. This branch is **`v3`** —
+> explicit SIMD via the JDK Vector API, with an A/B switch (`KNN_MODE`) so
+> we can measure the gain on the same binary.
 
 ---
 
 ## English
 
-In `v2` we package the v1 code into a real submission-shaped stack and run
-the official k6 test under the actual rinha environment (1 vCPU + 350 MB
-total). We add **no algorithmic changes**: the goal is to learn what the
-realistic constraints look like.
+In `v3` we replace the scalar squared-distance loop with explicit SIMD via
+`jdk.incubator.vector` (FloatVector, FMA, masked tail). Both modes coexist
+on the same binary — pick at startup with `KNN_MODE=scalar|vector`. A
+parity test ensures both produce identical fraud_scores within float32
+epsilon.
 
-**Spoiler:** v1's heap-resident dataset doesn't fit in two containers under
-350 MB. Even with relaxed memory we hit a 1-vCPU wall: each request is
-~50–200 ms, the test ramps to 900 req/s, the p99 cutoff fires. Score: **−6000**.
-That's the lesson — and it's what `v3` onward will fix with real numbers.
+**Findings:**
+- **Host (no limits): +16% p99 improvement.** Real but modest — C2 was
+  already auto-vectorizing the simple loop. Score moves +2649 → +2726.
+- **Docker (1 vCPU split 3 ways): both modes still hit −6000.** The
+  bottleneck is memory bandwidth, not CPU compute. SIMD makes the math
+  faster but each request still has to scan 168 MB of `float[]`.
+- **The next move (v4 = int8 quantization) is now the critical one.**
+  Shrinking the dataset 4× lets it fit in L3 cache, eliminates the
+  memory-bandwidth wall, AND doubles SIMD throughput (8-lane int8 vs
+  current 8-lane float32 with the same hardware).
 
-### Roadmap (revised in v2)
+### Roadmap (current)
 
-1. ✅ **`v1`** — scalar baseline, no infra, run on host JVM (final score: +2742)
-2. ✅ **`v2` (this branch)** — Docker stack + nginx LB + cgroup limits (final score: −6000)
-3. **`v3`** — SIMD via `jdk.incubator.vector` (Vector API)
-4. **`v4`** — int8 quantization of the dataset (168 MB → 42 MB)
+1. ✅ **`v1`** — scalar baseline on the host JVM (final score: +2742)
+2. ✅ **`v2`** — Docker stack + nginx LB + cgroup limits (final score: −6000)
+3. ✅ **`v3` (this branch)** — Vector API SIMD with KNN_MODE A/B (host: +2726, Docker: still −6000)
+4. **`v4`** — int8 quantization of the dataset (168 MB → 42 MB, fits in L3)
 5. **`v5`** — GraalVM `native-image` (kill warmup + slim RSS)
 6. (optional) **`v6`** — coarse k-means partitioning (sub-ms p99)
 
@@ -59,7 +66,8 @@ rinha-de-backend-andre-java/
 │       └── DatasetBuilder.java          # CLI: references.json.gz → vectors.bin
 └── src/test/java/...
     ├── JsonReaderTest.java
-    └── VectorizerTest.java
+    ├── VectorizerTest.java
+    └── KnnSearcherParityTest.java       # v3: SCALAR == VECTOR fraud_scores
 ```
 
 ---
@@ -126,12 +134,23 @@ warmup at startup (which only counts toward `/ready`, not p99) is a great
 trade. **In v2 with 0.45 vCPU per container, warmup balloons to ~37 s** —
 expected, since each warmup search now competes with itself for cache.
 
-#### Why no Vector API yet?
+#### Why explicit Vector API in v3?
 
-Per the v1 hypothesis, the C2 JIT already auto-vectorizes the simple distance
-loop and we're memory-bandwidth-bound, not CPU-bound. v2 confirmed CPU is the
-real wall under 1 vCPU. v3 will introduce explicit Vector API — and now we
-know it'll matter.
+C2 auto-vectorization is good but not deterministic — small loop changes can
+disable it silently. Explicit `FloatVector` guarantees SIMD generation, gives
+us FMA (one-rounding-step `sum + diff*diff`), and prepares the SIMD code
+path we'll reuse in `v4` with `ByteVector` for int8.
+
+v3 measured: +16% p99 on the host (deterministic SIMD beats partial auto-vec).
+On 1 vCPU under cgroup limits, the gain doesn't matter yet because we're
+memory-bound, not compute-bound — that's `v4`'s job.
+
+#### Why does `KNN_MODE` exist?
+
+A/B testing on the same binary, same JVM, same dataset. Switching between
+modes only changes the distance function. Lets us isolate the SIMD gain
+from any other variable, and lets us roll back instantly if a measurement
+disagrees with the parity test.
 
 ---
 
@@ -179,11 +198,19 @@ Files in `data/`:
 #### 4. Run the app on the host
 
 ```bash
-DATA_DIR=./data PORT=9999 \
-  java -Xmx256m \
-       --add-modules=jdk.incubator.vector \
+# Scalar mode (v1 algorithm, kept for A/B):
+DATA_DIR=./data PORT=9999 KNN_MODE=scalar \
+  java -Xmx256m --add-modules=jdk.incubator.vector \
+       -jar target/rinha-fraud.jar
+
+# Vector mode (default, explicit SIMD):
+DATA_DIR=./data PORT=9999 KNN_MODE=vector \
+  java -Xmx256m --add-modules=jdk.incubator.vector \
        -jar target/rinha-fraud.jar
 ```
+
+The startup line `[app] SIMD: ... (8 lanes, 256-bit, ...)` confirms which
+SIMD width was selected on your CPU.
 
 #### 5. Run unit tests
 
@@ -212,7 +239,11 @@ Image: `rinha-fraud:v2`, ~75 MB unpacked (Eclipse Temurin 25 JRE alpine + 25 KB 
 #### 3. Start
 
 ```bash
+# Default (vector mode):
 docker compose up -d
+
+# Scalar mode (v1 algorithm) — useful for A/B comparison:
+KNN_MODE=scalar docker compose up -d
 ```
 
 Three services come up:
@@ -305,32 +336,78 @@ generous host.
   k-means partitioning gets 10–20×. We'll need a stack of these.
 
 ---
+
+### A/B results — `v3` (Vector API)
+
+Same binary, same dataset, same workload. Only `KNN_MODE` changes.
+
+#### Host (no resource limits)
+
+| KNN_MODE | p99 | served | failure | final_score |
+|---|---|---|---|---|
+| `scalar` | 1480 ms | 21 218 | 0% | **+2649** |
+| `vector` | **1241 ms** | **24 424** | 0% | **+2726** |
+
+**Δ** — p99 −16%, throughput +15%, score **+77**. SIMD wins, but C2 was
+already doing partial auto-vectorization, so the explicit Vector API gain
+is a real but modest improvement.
+
+#### Docker stack (1 vCPU split 0.10 / 0.45 / 0.45)
+
+| KNN_MODE | p99 | served | failure | final_score |
+|---|---|---|---|---|
+| `scalar` | 2001 ms | 1 605 | 96.65% | **−6000** |
+| `vector` | 2001 ms | 1 188 | 97.54% | **−6000** |
+
+**Both modes hit the cutoff floor.** Under 1 vCPU split among 3 containers,
+each request still takes ~50–100 ms; the test ramps to 900 req/s, our
+capacity is ~30 req/s, p99 hits the 2 s wall, failure rate hits 97%, both
+rinha cutoffs fire.
+
+**The takeaway:** Vector API is a real win on the host but doesn't change
+the cliff. The cliff is memory bandwidth (each request scans 168 MB of
+`float[]`). The next branch (`v4` int8 quantization) shrinks the dataset
+to 42 MB so it fits in L3 cache and SIMD lanes double. That's the move
+that escapes −6000.
+
+#### Detection parity
+
+In every run, both modes produced identical fraud_scores within float32
+epsilon (verified by unit test) and the same TP / FP / FN breakdown.
+SIMD changed performance only — never correctness.
+
+---
 ---
 
 ## Português
 
 > **Estratégia de branches:** cada passo grande vive numa branch própria
 > (`v1`, `v2`, `v3`, ...). A submissão final vive em `main`. Esta branch é
-> a **`v2`** — o stack com restrições reais: Docker Compose, nginx LB, duas
-> réplicas da API, dentro do orçamento de CPU/memória da rinha.
+> a **`v3`** — SIMD explícito via JDK Vector API, com switch A/B
+> (`KNN_MODE`) para isolar o ganho no mesmo binário.
 
-Na `v2` empacotamos o código da v1 num stack com forma de submissão real e
-rodamos o teste oficial do k6 dentro do ambiente real da rinha (1 vCPU +
-350 MB no total). **Sem mudanças algorítmicas**: o objectivo é aprender
-como são as restrições de verdade.
+Na `v3` substituímos o loop scalar de distância quadrada por SIMD explícito
+via `jdk.incubator.vector` (FloatVector, FMA, tail mascarado). Os dois modos
+coexistem no mesmo binário — escolhe-se no startup com
+`KNN_MODE=scalar|vector`. Um teste de paridade garante que ambos produzem
+fraud_scores idênticos dentro do epsilon float32.
 
-**Spoiler:** o dataset em heap da v1 não cabe em duas instâncias dentro de
-350 MB. Mesmo afrouxando a memória, batemos no muro de 1 vCPU: cada request
-demora ~50–200 ms, o teste sobe para 900 req/s, o corte de p99 dispara.
-Score: **−6000**. Essa é a lição — e é o que `v3` em diante vai resolver
-com números reais.
+**Resultados:**
+- **Host (sem limites): +16% no p99.** Real mas modesto — o C2 já fazia
+  auto-vectorização parcial. Score: +2649 → +2726.
+- **Docker (1 vCPU dividido 3 vias): ambos batem −6000.** O gargalo é a
+  largura de banda da memória, não o CPU. SIMD acelera a matemática mas
+  cada request ainda lê 168 MB de `float[]`.
+- **A próxima jogada (v4 = quantização int8) é a crítica.** Encolher o
+  dataset 4× fá-lo caber em L3, elimina o muro de bandwidth, **e** dobra
+  a throughput SIMD (8 lanes int8 contra 8 lanes float32 no mesmo hardware).
 
-### Roadmap (revisto na v2)
+### Roadmap (atual)
 
-1. ✅ **`v1`** — baseline scalar, sem infra, JVM no host (final score: +2742)
-2. ✅ **`v2` (esta branch)** — Docker stack + nginx LB + cgroup limits (final score: −6000)
-3. **`v3`** — SIMD via `jdk.incubator.vector` (Vector API)
-4. **`v4`** — quantização int8 do dataset (168 MB → 42 MB)
+1. ✅ **`v1`** — baseline scalar na JVM do host (final score: +2742)
+2. ✅ **`v2`** — Docker stack + nginx LB + cgroup limits (final score: −6000)
+3. ✅ **`v3` (esta branch)** — Vector API SIMD com KNN_MODE A/B (host: +2726, Docker: ainda −6000)
+4. **`v4`** — quantização int8 do dataset (168 MB → 42 MB, cabe em L3)
 5. **`v5`** — GraalVM `native-image` (mata warmup + corta RSS)
 6. (opcional) **`v6`** — partição coarse com k-means (p99 sub-ms)
 
@@ -360,7 +437,8 @@ rinha-de-backend-andre-java/
 │       └── DatasetBuilder.java          # CLI: references.json.gz → vectors.bin
 └── src/test/java/...
     ├── JsonReaderTest.java
-    └── VectorizerTest.java
+    ├── VectorizerTest.java
+    └── KnnSearcherParityTest.java       # v3: SCALAR == VECTOR fraud_scores
 ```
 
 ---
@@ -424,11 +502,24 @@ A rinha mede p99 desde a primeira request, então pagar 1 segundo de warmup no
 startup (que conta para o `/ready`, não para o p99) é um ótimo trade. **Na v2
 com 0.45 vCPU por container, o warmup balona para ~37 s** — esperado.
 
-#### Por que não Vector API ainda?
+#### Por que Vector API explícita na v3?
 
-Pela hipótese da v1, o JIT C2 já auto-vetoriza o loop simples e estamos
-memory-bandwidth-bound. A v2 confirmou que sob 1 vCPU o muro real é CPU. A
-v3 vai introduzir Vector API explícita — agora sabemos que vai pesar.
+A auto-vectorização do C2 funciona mas não é determinística — pequenas
+mudanças no loop podem desactivá-la silenciosamente. `FloatVector` explícito
+garante geração SIMD, dá-nos FMA (`sum + diff*diff` numa única instrução
+com uma só rounding step), e prepara o caminho SIMD que vamos reutilizar
+na `v4` com `ByteVector` para int8.
+
+A v3 mediu: +16% no p99 do host (SIMD determinístico bate auto-vectorização
+parcial). Sob 1 vCPU com cgroup, o ganho ainda não importa porque estamos
+memory-bound, não compute-bound — esse é o trabalho da `v4`.
+
+#### Por que existe `KNN_MODE`?
+
+Testes A/B no mesmo binário, mesma JVM, mesmo dataset. Mudar de modo só
+muda a função de distância. Permite isolar o ganho de SIMD de qualquer
+outra variável e fazer rollback instantâneo se uma medição discordar do
+teste de paridade.
 
 ---
 
@@ -467,11 +558,19 @@ java -cp target/classes \
 #### 4. Rodar a aplicação no host
 
 ```bash
-DATA_DIR=./data PORT=9999 \
-  java -Xmx256m \
-       --add-modules=jdk.incubator.vector \
+# Modo scalar (algoritmo da v1, mantido para A/B):
+DATA_DIR=./data PORT=9999 KNN_MODE=scalar \
+  java -Xmx256m --add-modules=jdk.incubator.vector \
+       -jar target/rinha-fraud.jar
+
+# Modo vector (default, SIMD explícito):
+DATA_DIR=./data PORT=9999 KNN_MODE=vector \
+  java -Xmx256m --add-modules=jdk.incubator.vector \
        -jar target/rinha-fraud.jar
 ```
+
+A linha de startup `[app] SIMD: ... (8 lanes, 256-bit, ...)` confirma a
+largura SIMD selecionada na tua CPU.
 
 #### 5. Rodar testes unitários
 
@@ -495,7 +594,11 @@ docker compose build
 #### 3. Subir
 
 ```bash
+# Default (modo vector):
 docker compose up -d
+
+# Modo scalar (algoritmo da v1) — útil para comparação A/B:
+KNN_MODE=scalar docker compose up -d
 ```
 
 | Serviço | Porta | CPU | Memória | Função |
@@ -582,3 +685,44 @@ generoso.
   (≈25× de speedup).
 - Vector API sozinha dá 30–50%. Quantização int8 dá 4–8×. Partição coarse
   com k-means dá 10–20×. Vamos precisar de uma combinação.
+
+---
+
+### Resultados A/B — `v3` (Vector API)
+
+Mesmo binário, mesmo dataset, mesma carga. Só `KNN_MODE` muda.
+
+#### Host (sem limites de recursos)
+
+| KNN_MODE | p99 | servidos | falha | final_score |
+|---|---|---|---|---|
+| `scalar` | 1480 ms | 21 218 | 0% | **+2649** |
+| `vector` | **1241 ms** | **24 424** | 0% | **+2726** |
+
+**Δ** — p99 −16%, throughput +15%, score **+77**. SIMD ganha, mas o C2 já
+fazia auto-vectorização parcial, então o ganho do Vector API explícito é
+real mas modesto.
+
+#### Stack Docker (1 vCPU dividida 0.10 / 0.45 / 0.45)
+
+| KNN_MODE | p99 | servidos | falha | final_score |
+|---|---|---|---|---|
+| `scalar` | 2001 ms | 1 605 | 96.65% | **−6000** |
+| `vector` | 2001 ms | 1 188 | 97.54% | **−6000** |
+
+**Os dois modos batem o piso do corte.** Sob 1 vCPU dividida em 3
+containers, cada request demora ~50–100 ms; o teste sobe a 900 req/s,
+a nossa capacidade é ~30 req/s, o p99 chega ao muro de 2 s, a falha
+chega a 97%, ambos os cortes da rinha disparam.
+
+**A leitura:** Vector API é uma vitória real no host mas não muda o
+precipício. O precipício é a largura de banda da memória (cada request
+percorre 168 MB de `float[]`). A próxima branch (`v4` quantização int8)
+encolhe o dataset para 42 MB para caber em L3 e dobra as lanes SIMD.
+É a jogada que escapa ao −6000.
+
+#### Paridade da detecção
+
+Em todos os runs, ambos os modos produziram fraud_scores idênticos dentro
+do epsilon de float32 (verificado por teste unitário) e o mesmo breakdown
+de TP / FP / FN. SIMD mudou só performance — nunca correctness.

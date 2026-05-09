@@ -42,6 +42,10 @@ services:
       PORT: 9999
       DATA_DIR: /data
       THREADS: 2
+      # Distance compute mode — set on the host with `KNN_MODE=scalar` or
+      # `KNN_MODE=vector` (default) before `docker compose up`. Used by v3
+      # to A/B test SIMD vs scalar under the same cgroup constraints.
+      KNN_MODE: ${KNN_MODE:-vector}
       # Heap explicitly sized below the cgroup limit. -XX:+UseSerialGC is
       # cheaper than G1 on a single core and gives more predictable pauses.
       # NOTE: 320m heap exceeds the rinha 175m-per-instance budget. v1 cannot

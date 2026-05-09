@@ -18,6 +18,7 @@ import java.util.concurrent.Executors;
  *   PORT      — HTTP port (default 9999, as required by the challenge)
  *   DATA_DIR  — directory containing vectors.bin + labels.bin (default ./data)
  *   THREADS   — HttpServer thread pool size (default = number of CPUs)
+ *   KNN_MODE  — distance computation mode: "scalar" or "vector" (default "vector")
  *
  * Initialization order matters:
  *   1. Load the dataset FIRST. Takes ~3-10s for 168MB of data.
@@ -31,6 +32,10 @@ public final class App {
         int port = envInt("PORT", 9999);
         Path dataDir = Path.of(env("DATA_DIR", "./data"));
         int threads = envInt("THREADS", Runtime.getRuntime().availableProcessors());
+        KnnSearcher.Mode knnMode = parseMode(env("KNN_MODE", "vector"));
+
+        System.out.println("[app] SIMD: " + KnnSearcher.simdInfo());
+        System.out.println("[app] KNN_MODE=" + knnMode);
 
         long t0 = System.currentTimeMillis();
         System.out.println("[app] loading dataset from " + dataDir.toAbsolutePath());
@@ -40,12 +45,13 @@ public final class App {
                 dataset.count(), loadMs);
 
         // Minimal JIT warmup: runs a dummy search so the first real request
-        // doesn't pay the cost of compilation.
-        warmup(dataset);
+        // doesn't pay the cost of compilation. Uses the same mode as the
+        // request handlers so we warm the right code path.
+        warmup(dataset, knnMode);
 
         HttpServer server = HttpServer.create(new InetSocketAddress(port), 0);
         server.createContext("/ready", new ReadyHandler());
-        server.createContext("/fraud-score", new FraudHandler(dataset));
+        server.createContext("/fraud-score", new FraudHandler(dataset, knnMode));
         // Fixed pool. For 1 vCPU, 2-4 threads is enough — more than that just
         // generates context-switch overhead with no real gain.
         server.setExecutor(Executors.newFixedThreadPool(threads));
@@ -59,15 +65,24 @@ public final class App {
      * compile the hot paths before the first real request, reducing the early
      * p99 of the test.
      */
-    private static void warmup(Dataset ds) {
-        var searcher = new KnnSearcher(ds);
+    private static void warmup(Dataset ds, KnnSearcher.Mode mode) {
+        var searcher = new KnnSearcher(ds, mode);
         float[] q = new float[Dataset.DIMS];
-        Random rng = new java.util.Random(42);
+        Random rng = new Random(42);
         for (int i = 0; i < 1000; i++) {
             for (int j = 0; j < q.length; j++) q[j] = rng.nextFloat();
             searcher.fraudScore(q);
         }
         System.out.println("[app] warmup complete");
+    }
+
+    private static KnnSearcher.Mode parseMode(String s) {
+        return switch (s.toLowerCase()) {
+            case "scalar" -> KnnSearcher.Mode.SCALAR;
+            case "vector" -> KnnSearcher.Mode.VECTOR;
+            default -> throw new IllegalArgumentException(
+                    "KNN_MODE must be 'scalar' or 'vector', got '" + s + "'");
+        };
     }
 
     private static String env(String key, String def) {

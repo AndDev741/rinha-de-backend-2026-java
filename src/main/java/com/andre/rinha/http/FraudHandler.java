@@ -34,14 +34,16 @@ import java.io.InputStream;
 public final class FraudHandler implements HttpHandler {
 
     private final Dataset dataset;
+    private final KnnSearcher.Mode mode;
 
     // ThreadLocals: each thread has its own KnnSearcher and query buffer.
     private final ThreadLocal<KnnSearcher> searcherTl;
     private final ThreadLocal<float[]> queryTl = ThreadLocal.withInitial(() -> new float[Vectorizer.DIMS]);
 
-    public FraudHandler(Dataset dataset) {
+    public FraudHandler(Dataset dataset, KnnSearcher.Mode mode) {
         this.dataset = dataset;
-        this.searcherTl = ThreadLocal.withInitial(() -> new KnnSearcher(this.dataset));
+        this.mode = mode;
+        this.searcherTl = ThreadLocal.withInitial(() -> new KnnSearcher(this.dataset, this.mode));
     }
 
     @Override
