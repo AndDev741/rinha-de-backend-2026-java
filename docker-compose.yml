@@ -1,0 +1,82 @@
+# ─────────────────────────────────────────────────────────────
+# rinha-fraud — local stack
+#
+# Layout:
+#   client → nginx (lb) → round-robin → api-1 + api-2
+#
+# Resource budget (rinha rules: 1 CPU + 350 MB total, sum across services):
+#   nginx     : 0.10 CPU /  30 MB
+#   api-1     : 0.45 CPU / 160 MB
+#   api-2     : 0.45 CPU / 160 MB
+#   ──────────────────────────────
+#   TOTAL     : 1.00 CPU / 350 MB
+#
+# Honest caveat for v2:
+#   Our v1 code copies the 161 MB dataset into a heap float[]. That alone
+#   exceeds 160 MB per instance (with JVM overhead the JVM needs ~240 MB).
+#   So with the strict 160 MB limit set below, both api containers will OOM
+#   at startup. THAT IS THE LESSON of v2 — it proves why v3/v4 (memory
+#   reduction via mmap-only loading or int8 quantization) is unavoidable.
+#
+#   For a working local run while we still have v1 search code, swap the
+#   `mem_limit` lines to 256m on api-1 and api-2. Total goes to 542 MB,
+#   over budget, but lets us measure CPU performance under the realistic
+#   1-vCPU constraint. See the README for both modes.
+# ─────────────────────────────────────────────────────────────
+
+services:
+  api-1: &api
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: rinha-fraud:v2
+    networks:
+      - rinha-net
+    volumes:
+      # Both API containers see the same dataset via the same inode.
+      # The Linux kernel shares the page cache between them, so the
+      # 161 MB of vectors.bin is paid only once at OS level — even if
+      # cgroup accounting may double-count per container.
+      - ./data:/data:ro
+    environment:
+      PORT: 9999
+      DATA_DIR: /data
+      THREADS: 2
+      # Heap explicitly sized below the cgroup limit. -XX:+UseSerialGC is
+      # cheaper than G1 on a single core and gives more predictable pauses.
+      # NOTE: 320m heap exceeds the rinha 175m-per-instance budget. v1 cannot
+      # fit because the dataset is heap-resident (168 MB float[]). v3/v4
+      # will solve this — for v2 we measure the 1-vCPU bottleneck.
+      JAVA_OPTS: "-Xmx320m -XX:+UseSerialGC --add-modules=jdk.incubator.vector"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.45"
+          memory: "380M"
+
+  api-2:
+    <<: *api
+
+  lb:
+    image: nginx:1.27-alpine
+    depends_on:
+      - api-1
+      - api-2
+    networks:
+      - rinha-net
+    ports:
+      # Only the LB is reachable from the host. The api-* services are
+      # only addressable inside the rinha-net bridge.
+      - "9999:9999"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    deploy:
+      resources:
+        limits:
+          cpus: "0.10"
+          memory: "30M"
+
+networks:
+  rinha-net:
+    # Bridge mode is required by the rinha rules (no host, no privileged).
+    driver: bridge

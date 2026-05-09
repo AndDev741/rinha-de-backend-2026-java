@@ -2,25 +2,33 @@
 
 > **🇬🇧 [English](#english) · 🇧🇷 [Português](#português)**
 
-> **Branch strategy:** each major optimization step lives on its own branch
-> (`v1`, `v2`, `v3`, ...). The final submission lives on `main`. This branch
-> is **`v1`** — the baseline.
+> **Branch strategy:** each major step lives on its own branch (`v1`, `v2`,
+> `v3`, ...). The final submission lives on `main`. This branch is **`v2`** —
+> the realistic-constraints stack: Docker Compose, nginx LB, two API replicas,
+> with the rinha CPU/memory budget.
 
 ---
 
 ## English
 
-Step-1 skeleton of our plan: JDK HTTP server + hand-rolled JSON parser +
-heap-resident `float[]` dataset (loaded via mmap). **No Spring, no Jackson,
-no Helidon.**
+In `v2` we package the v1 code into a real submission-shaped stack and run
+the official k6 test under the actual rinha environment (1 vCPU + 350 MB
+total). We add **no algorithmic changes**: the goal is to learn what the
+realistic constraints look like.
 
-The goal of this step is a measurable baseline. From here we'll layer:
+**Spoiler:** v1's heap-resident dataset doesn't fit in two containers under
+350 MB. Even with relaxed memory we hit a 1-vCPU wall: each request is
+~50–200 ms, the test ramps to 900 req/s, the p99 cutoff fires. Score: **−6000**.
+That's the lesson — and it's what `v3` onward will fix with real numbers.
 
-1. ✅ **(step 1 — this branch, `v1`)** scalar baseline, stock JVM
-2. SIMD via `jdk.incubator.vector` (Vector API) — branch `v2`
-3. Native compilation with GraalVM `native-image` — branch `v3`
-4. int8 quantization (if memory gets tight) — branch `v4`
-5. Optionally coarse partitioning (k-means) — branch `v5`
+### Roadmap (revised in v2)
+
+1. ✅ **`v1`** — scalar baseline, no infra, run on host JVM (final score: +2742)
+2. ✅ **`v2` (this branch)** — Docker stack + nginx LB + cgroup limits (final score: −6000)
+3. **`v3`** — SIMD via `jdk.incubator.vector` (Vector API)
+4. **`v4`** — int8 quantization of the dataset (168 MB → 42 MB)
+5. **`v5`** — GraalVM `native-image` (kill warmup + slim RSS)
+6. (optional) **`v6`** — coarse k-means partitioning (sub-ms p99)
 
 Each branch is self-contained and lets us compare scores side-by-side as we
 evolve the solution.
@@ -31,7 +39,10 @@ evolve the solution.
 
 ```
 rinha-de-backend-andre-java/
-├── pom.xml                              # Maven, Java 21, zero runtime deps
+├── pom.xml                              # Maven, Java 25, zero runtime deps
+├── Dockerfile                           # multi-stage build: Maven → JRE 25
+├── docker-compose.yml                   # nginx + 2× api, with cgroup limits
+├── nginx.conf                           # round-robin LB
 ├── src/main/java/com/andre/rinha/
 │   ├── App.java                         # entry point, starts HTTP server
 │   ├── http/
@@ -79,9 +90,9 @@ The challenge contract is fixed, so this is a conscious choice.
 - virtual call (`HeapByteBuffer` vs `DirectByteBuffer`)
 - the C2 JIT doesn't auto-vectorize loops over ByteBuffer, but it does over `float[]`
 
-Cost: 168 MB of heap. Fits in `-Xmx256m`. It'll get tight when we run two
-instances in 350 MB total — that's where int8 quantization comes in (step 4:
-168 MB → 42 MB).
+Cost: 168 MB of heap. Fits in `-Xmx320m`. **It does NOT fit twice in 350 MB
+total** (proven in v2). That's why `v4` will tackle this with int8 quantization
+(168 MB → 42 MB).
 
 #### Why a `BitSet` for the labels?
 
@@ -112,26 +123,25 @@ interpreted and costs 10–50× more than a "warm" request.
 
 The challenge measures p99 from the first request, so paying ~1 second of
 warmup at startup (which only counts toward `/ready`, not p99) is a great
-trade.
+trade. **In v2 with 0.45 vCPU per container, warmup balloons to ~37 s** —
+expected, since each warmup search now competes with itself for cache.
 
 #### Why no Vector API yet?
 
-The C2 JIT already auto-vectorizes the simple distance loop. Explicit Vector
-API will only help once we leave the memory-bound regime. With 168 MB read
-sequentially, the bottleneck is RAM bandwidth (~20 GB/s on the test box),
-not CPU.
-
-int8 quantization will shrink the footprint 4× and shift the regime.
+Per the v1 hypothesis, the C2 JIT already auto-vectorizes the simple distance
+loop and we're memory-bandwidth-bound, not CPU-bound. v2 confirmed CPU is the
+real wall under 1 vCPU. v3 will introduce explicit Vector API — and now we
+know it'll matter.
 
 ---
 
-### Build and run
+### Build and run — host (v1 mode)
 
 #### 1. Prerequisites
 
 ```bash
-# Java 21 (any distro: Temurin, Zulu, Amazon Corretto…)
-java -version   # must show 21+
+# Java 25 (any distro: Temurin, Zulu, Amazon Corretto…)
+java -version   # must show 25+
 
 # Maven
 mvn -v
@@ -161,20 +171,12 @@ java -cp target/classes \
      ./data
 ```
 
-Expected output:
-```
-[builder] 1000000 processed (12.4s)
-[builder] 2000000 processed (24.7s)
-[builder] 3000000 processed (37.1s)
-[builder] OK: 3000000 vectors, 999406 frauds (33.31%) in 37.1s
-```
-
 Files in `data/`:
 - `vectors.bin` — ~161 MB
 - `labels.bin`  — ~367 KB
 - `meta.txt`    — sanity check
 
-#### 4. Run the app
+#### 4. Run the app on the host
 
 ```bash
 DATA_DIR=./data PORT=9999 \
@@ -183,125 +185,154 @@ DATA_DIR=./data PORT=9999 \
        -jar target/rinha-fraud.jar
 ```
 
-Expected output:
-```
-[app] loading dataset from /home/.../data
-[app] dataset loaded: 3000000 vectors in 207 ms
-[app] warmup complete
-[app] listening on :9999 with 4 threads
-```
-
-#### 5. Smoke test
-
-```bash
-# Health
-curl -i http://localhost:9999/ready
-
-# Fraud score (legit example from official docs)
-curl -s -X POST http://localhost:9999/fraud-score \
-     -H 'Content-Type: application/json' \
-     -d '{
-       "id": "tx-1329056812",
-       "transaction":      { "amount": 41.12, "installments": 2, "requested_at": "2026-03-11T18:45:53Z" },
-       "customer":         { "avg_amount": 82.24, "tx_count_24h": 3, "known_merchants": ["MERC-003", "MERC-016"] },
-       "merchant":         { "id": "MERC-016", "mcc": "5411", "avg_amount": 60.25 },
-       "terminal":         { "is_online": false, "card_present": true, "km_from_home": 29.23 },
-       "last_transaction": null
-     }'
-# Expected: {"approved":true,"fraud_score":0.0}
-```
-
-#### 6. Run unit tests
+#### 5. Run unit tests
 
 ```bash
 mvn -q test
 ```
 
-Just enough to validate parser and vectorization against the example in the
-official docs.
+---
+
+### Run the Docker stack — v2
+
+This is the actual submission-shaped stack: nginx LB on `:9999`, two API
+replicas, all on a bridge network.
+
+#### 1. Make sure the dataset is generated (step 3 above)
+
+#### 2. Build images
+
+```bash
+cd ~/andP/rinha-de-backend-andre-java
+docker compose build
+```
+
+Image: `rinha-fraud:v2`, ~75 MB unpacked (Eclipse Temurin 25 JRE alpine + 25 KB JAR).
+
+#### 3. Start
+
+```bash
+docker compose up -d
+```
+
+Three services come up:
+
+| Service | Port | CPU | Memory | Role |
+|---|---|---|---|---|
+| `lb` (nginx) | host:9999 | 0.10 | 30 MB | round-robin LB |
+| `api-1` | internal | 0.45 | 380 MB | Java app, instance 1 |
+| `api-2` | internal | 0.45 | 380 MB | Java app, instance 2 |
+
+> **Note on memory:** the rinha rule is **350 MB total**. We use `380 MB per
+> api` (and 30 MB for nginx) — over budget. v1's heap-resident dataset
+> physically can't fit twice in 350 MB. v3/v4 will solve this; v2 measures
+> performance under the realistic 1-vCPU constraint while we still have
+> v1's memory profile.
+
+Wait ~40 s for warmup (yes, that's slow under 0.45 CPU):
+
+```bash
+until curl -s -f http://localhost:9999/ready > /dev/null; do sleep 1; done
+echo "stack ready"
+```
+
+#### 4. Smoke / load test
+
+From the rinha repo root (so the relative path `test/results.json` works):
+
+```bash
+cd ~/andP/rinha-de-backend-2026
+k6 run test/test.js
+cat test/results.json
+```
+
+#### 5. Tear down
+
+```bash
+cd ~/andP/rinha-de-backend-andre-java
+docker compose down
+```
 
 ---
 
-### Roadmap
-
-| # | Branch | What | For |
-|---|---|---|---|
-| 1 | ✅ `v1` (this) | scalar baseline | establish the number to beat |
-| 2 | `v2` | Vector API in `KnnSearcher` | shave 30–50% off p99 |
-| 3 | `v3` | GraalVM `native-image` | kill warmup + cut RSS to ~50 MB |
-| 4 | `v4` | int8 dataset quantization | fit 2 instances comfortably in 350 MB |
-| 5 | `v5` | Docker Compose + nginx LB | actual submission |
-| 6 | (optional) | coarse k-means partitioning | sub-ms p99 if we still want it |
-
-Once we have a measured baseline, we decide which optimization is worth the
-effort based on numbers, not gut feel.
-
----
-
-### Baseline results — `v1`
+### Baseline results — `v1` (host JVM, no limits)
 
 > 4 threads, single instance, no resource limits
 
+```
+p99            = 1194 ms
+detection      = 2819 / 3000 (0 FP, 1 FN, 0 errs out of 25k served)
+final_score    = +2742
+```
+
+Detection essentially perfect. p99 paid the cost of being tested on a
+generous host.
+
+---
+
+### Stress-test results — `v2` (Docker, 1 vCPU split 3 ways)
+
+> nginx + 2× api, cpus split 0.10 / 0.45 / 0.45, mem relaxed for measurement
+
 ```json
 {
-  "expected": {
-    "total": 54100,
-    "fraud_count": 24058,
-    "legit_count": 30042,
-    "fraud_rate": 0.4447,
-    "legit_rate": 0.5553,
-    "edge_case_count": 797,
-    "edge_case_rate": 0.0147
-  },
-  "p99": "1194.22ms",
+  "p99": "2001.10ms",
   "scoring": {
     "breakdown": {
       "false_positive_detections": 0,
-      "false_negative_detections": 1,
-      "true_positive_detections": 11138,
-      "true_negative_detections": 14043,
-      "http_errors": 0
+      "false_negative_detections": 0,
+      "true_positive_detections": 594,
+      "true_negative_detections": 667,
+      "http_errors": 46879
     },
-    "failure_rate": "0%",
-    "weighted_errors_E": 3,
-    "error_rate_epsilon": 0.000119,
-    "p99_score": {
-      "value": -77.08,
-      "cut_triggered": false
-    },
-    "detection_score": {
-      "value": 2819.38,
-      "rate_component": 3000,
-      "absolute_penalty": -180.62,
-      "cut_triggered": false
-    },
-    "final_score": 2742.3
+    "failure_rate": "97.38%",
+    "p99_score": { "value": -3000, "cut_triggered": true },
+    "detection_score": { "value": -3000, "cut_triggered": true },
+    "final_score": -6000
   }
 }
 ```
 
-Detection is essentially perfect. Latency is the entire gap between us and
-the top of the leaderboard — that's what `v2` onward will attack.
+**What this tells us:**
+
+- The host laptop was inflating v1 by ~10×. Reality is harsher.
+- Detection logic is still perfect: among the 1 261 successfully served
+  requests we got **0 FP, 0 FN**.
+- Capacity ≈ 2 instances × 10 req/s = 20 req/s. The k6 test ramps to 900
+  req/s — 45× our capacity → cascade of timeouts → both rinha cutoffs fire.
+- To survive, **each request must drop from ~100 ms to ~2–3 ms** (≈25× speedup).
+- Vector API alone gets us 30–50%. int8 quantization gets 4–8×. Coarse
+  k-means partitioning gets 10–20×. We'll need a stack of these.
 
 ---
 ---
 
 ## Português
 
-> **Estratégia de branches:** cada otimização grande vive numa branch própria
-> (`v1`, `v2`, `v3`, ...). A submissão final vive em `main`. Esta branch é a
-> **`v1`** — a baseline.
+> **Estratégia de branches:** cada passo grande vive numa branch própria
+> (`v1`, `v2`, `v3`, ...). A submissão final vive em `main`. Esta branch é
+> a **`v2`** — o stack com restrições reais: Docker Compose, nginx LB, duas
+> réplicas da API, dentro do orçamento de CPU/memória da rinha.
 
-Esqueleto **Passo 1** do nosso plano: HTTP server da JDK + parser JSON manual + dataset
-em `float[]` heap-resident (carregado via mmap). **Sem Spring, sem Jackson, sem Helidon.**
+Na `v2` empacotamos o código da v1 num stack com forma de submissão real e
+rodamos o teste oficial do k6 dentro do ambiente real da rinha (1 vCPU +
+350 MB no total). **Sem mudanças algorítmicas**: o objectivo é aprender
+como são as restrições de verdade.
 
-O objetivo deste passo é ter uma baseline mensurável para depois aplicarmos:
+**Spoiler:** o dataset em heap da v1 não cabe em duas instâncias dentro de
+350 MB. Mesmo afrouxando a memória, batemos no muro de 1 vCPU: cada request
+demora ~50–200 ms, o teste sobe para 900 req/s, o corte de p99 dispara.
+Score: **−6000**. Essa é a lição — e é o que `v3` em diante vai resolver
+com números reais.
 
-1. ✅ **(passo 1 — esta branch, `v1`)** baseline scalar, JVM padrão
-2. SIMD via `jdk.incubator.vector` (Vector API) — branch `v2`
-3. Compilação nativa com GraalVM `native-image` — branch `v3`
-4. Quantização int8 (se a memória apertar) — branch `v4`
-5. Eventualmente partição coarse (k-means) — branch `v5`
+### Roadmap (revisto na v2)
+
+1. ✅ **`v1`** — baseline scalar, sem infra, JVM no host (final score: +2742)
+2. ✅ **`v2` (esta branch)** — Docker stack + nginx LB + cgroup limits (final score: −6000)
+3. **`v3`** — SIMD via `jdk.incubator.vector` (Vector API)
+4. **`v4`** — quantização int8 do dataset (168 MB → 42 MB)
+5. **`v5`** — GraalVM `native-image` (mata warmup + corta RSS)
+6. (opcional) **`v6`** — partição coarse com k-means (p99 sub-ms)
 
 ---
 
@@ -309,7 +340,10 @@ O objetivo deste passo é ter uma baseline mensurável para depois aplicarmos:
 
 ```
 rinha-de-backend-andre-java/
-├── pom.xml                              # Maven, Java 21, zero deps de runtime
+├── pom.xml                              # Maven, Java 25, zero deps de runtime
+├── Dockerfile                           # build multi-stage: Maven → JRE 25
+├── docker-compose.yml                   # nginx + 2× api, com limites cgroup
+├── nginx.conf                           # round-robin LB
 ├── src/main/java/com/andre/rinha/
 │   ├── App.java                         # entry point, sobe HTTP server
 │   ├── http/
@@ -356,8 +390,9 @@ o schema é fixo no contrato, então é uma escolha consciente.
 - chamada virtual (`HeapByteBuffer` vs `DirectByteBuffer`)
 - o JIT C2 não auto-vetoriza loops sobre ByteBuffer, mas auto-vetoriza sobre `float[]`
 
-Custo: 168 MB de heap. Cabe em `-Xmx256m`. Vai apertar quando rodarmos 2 instâncias
-em 350 MB total — aí entra a quantização int8 (passo 4: 168 MB → 42 MB).
+Custo: 168 MB de heap. Cabe em `-Xmx320m`. **Não cabe duas vezes em 350 MB
+totais** (provado na v2). É por isso que a `v4` vai resolver com quantização
+int8 (168 MB → 42 MB).
 
 #### Por que `BitSet` para os labels?
 
@@ -386,25 +421,24 @@ depois C2 (lento, muito otimizado). A primeira request real pega tudo interpreta
 e custa 10–50× mais que uma request "quente".
 
 A rinha mede p99 desde a primeira request, então pagar 1 segundo de warmup no
-startup (que conta para o `/ready`, não para o p99) é um ótimo trade.
+startup (que conta para o `/ready`, não para o p99) é um ótimo trade. **Na v2
+com 0.45 vCPU por container, o warmup balona para ~37 s** — esperado.
 
 #### Por que não Vector API ainda?
 
-O JIT C2 já auto-vetoriza o loop simples de distância. Vector API explícita só vai
-ajudar quando sairmos do regime memory-bound. Para 168 MB acessados sequencialmente,
-o gargalo é a banda de RAM (~20 GB/s na máquina-alvo), não o CPU.
-
-Quantização int8 vai diminuir o footprint em 4× e aí o regime muda.
+Pela hipótese da v1, o JIT C2 já auto-vetoriza o loop simples e estamos
+memory-bandwidth-bound. A v2 confirmou que sob 1 vCPU o muro real é CPU. A
+v3 vai introduzir Vector API explícita — agora sabemos que vai pesar.
 
 ---
 
-### Como buildar e rodar
+### Como buildar e rodar — host (modo v1)
 
 #### 1. Pré-requisitos
 
 ```bash
-# Java 21 (qualquer distro: Temurin, Zulu, Amazon Corretto…)
-java -version   # deve mostrar 21+
+# Java 25 (qualquer distro: Temurin, Zulu, Amazon Corretto…)
+java -version   # deve mostrar 25+
 
 # Maven
 mvn -v
@@ -417,16 +451,12 @@ cd ~/andP/rinha-de-backend-andre-java
 mvn -q clean package
 ```
 
-Saída: `target/rinha-fraud.jar`.
-
 #### 3. Gerar o dataset binário
 
-Roda **uma vez**. Pega o `references.json.gz` do repo da rinha e cospe os dois
-ficheiros que vamos `mmap` em runtime.
+Roda **uma vez**:
 
 ```bash
 mkdir -p data
-
 java -cp target/classes \
      --add-modules=jdk.incubator.vector \
      com.andre.rinha.prep.DatasetBuilder \
@@ -434,20 +464,7 @@ java -cp target/classes \
      ./data
 ```
 
-Logs esperados:
-```
-[builder] 1000000 processed (12.4s)
-[builder] 2000000 processed (24.7s)
-[builder] 3000000 processed (37.1s)
-[builder] OK: 3000000 vectors, 999406 frauds (33.31%) in 37.1s
-```
-
-Saída em `data/`:
-- `vectors.bin` — ~161 MB
-- `labels.bin`  — ~367 KB
-- `meta.txt`    — sanity check
-
-#### 4. Rodar a aplicação
+#### 4. Rodar a aplicação no host
 
 ```bash
 DATA_DIR=./data PORT=9999 \
@@ -456,102 +473,112 @@ DATA_DIR=./data PORT=9999 \
        -jar target/rinha-fraud.jar
 ```
 
-Logs esperados:
-```
-[app] loading dataset from /home/.../data
-[app] dataset loaded: 3000000 vectors in 207 ms
-[app] warmup complete
-[app] listening on :9999 with 4 threads
-```
-
-#### 5. Smoke test
-
-```bash
-# Health
-curl -i http://localhost:9999/ready
-
-# Fraud score (caso legítimo da doc oficial)
-curl -s -X POST http://localhost:9999/fraud-score \
-     -H 'Content-Type: application/json' \
-     -d '{
-       "id": "tx-1329056812",
-       "transaction":      { "amount": 41.12, "installments": 2, "requested_at": "2026-03-11T18:45:53Z" },
-       "customer":         { "avg_amount": 82.24, "tx_count_24h": 3, "known_merchants": ["MERC-003", "MERC-016"] },
-       "merchant":         { "id": "MERC-016", "mcc": "5411", "avg_amount": 60.25 },
-       "terminal":         { "is_online": false, "card_present": true, "km_from_home": 29.23 },
-       "last_transaction": null
-     }'
-# Esperado: {"approved":true,"fraud_score":0.0}
-```
-
-#### 6. Rodar testes unitários
+#### 5. Rodar testes unitários
 
 ```bash
 mvn -q test
 ```
 
-São poucos por enquanto — apenas o suficiente para validar parser e vetorização
-contra o exemplo da documentação oficial.
+---
+
+### Rodar o stack Docker — v2
+
+#### 1. Garantir o dataset gerado (passo 3 acima)
+
+#### 2. Build das imagens
+
+```bash
+cd ~/andP/rinha-de-backend-andre-java
+docker compose build
+```
+
+#### 3. Subir
+
+```bash
+docker compose up -d
+```
+
+| Serviço | Porta | CPU | Memória | Função |
+|---|---|---|---|---|
+| `lb` (nginx) | host:9999 | 0.10 | 30 MB | LB round-robin |
+| `api-1` | interno | 0.45 | 380 MB | App Java, instância 1 |
+| `api-2` | interno | 0.45 | 380 MB | App Java, instância 2 |
+
+> **Nota sobre memória:** a regra da rinha é **350 MB total**. Estamos a
+> usar **380 MB por api** (+30 MB nginx) — fora do orçamento. O dataset em
+> heap da v1 fisicamente não cabe duas vezes em 350 MB. v3/v4 vão resolver;
+> a v2 mede performance debaixo da restrição realista de 1 vCPU enquanto
+> ainda temos o perfil de memória da v1.
+
+Espera ~40s pelo warmup (sim, é lento sob 0.45 CPU):
+
+```bash
+until curl -s -f http://localhost:9999/ready > /dev/null; do sleep 1; done
+echo "stack pronto"
+```
+
+#### 4. Smoke / load test
+
+A partir da raiz do repo da rinha:
+
+```bash
+cd ~/andP/rinha-de-backend-2026
+k6 run test/test.js
+cat test/results.json
+```
+
+#### 5. Derrubar
+
+```bash
+cd ~/andP/rinha-de-backend-andre-java
+docker compose down
+```
 
 ---
 
-### Próximos passos (em ordem)
+### Resultados da Baseline — `v1` (JVM no host, sem limites)
 
-| # | Branch | O quê | Para quê |
-|---|---|---|---|
-| 1 | ✅ `v1` (este) | baseline scalar | estabelecer o número a bater |
-| 2 | `v2` | Vector API no `KnnSearcher` | tirar 30–50% do p99 |
-| 3 | `v3` | GraalVM `native-image` | matar warmup + cortar RSS para ~50MB |
-| 4 | `v4` | quantização int8 do dataset | caber 2 instâncias confortavelmente |
-| 5 | `v5` | Docker compose + nginx LB | submissão real |
-| 6 | (opcional) | k-means coarse | sub-ms p99 se ainda quisermos |
+```
+p99            = 1194 ms
+detection      = 2819 / 3000 (0 FP, 1 FN, 0 errs em 25k servidos)
+final_score    = +2742
+```
 
-Quando estivermos com baseline medida, decidimos qual otimização vale o esforço
-com base nos números, não no instinto.
+Detecção praticamente perfeita. O p99 pagou o custo de ser testado num host
+generoso.
 
 ---
 
-### Resultados da Baseline — `v1`
-
-> Com 4 threads, instância única, sem limite de recursos
+### Stress-test — `v2` (Docker, 1 vCPU dividida 3 vias)
 
 ```json
 {
-  "expected": {
-    "total": 54100,
-    "fraud_count": 24058,
-    "legit_count": 30042,
-    "fraud_rate": 0.4447,
-    "legit_rate": 0.5553,
-    "edge_case_count": 797,
-    "edge_case_rate": 0.0147
-  },
-  "p99": "1194.22ms",
+  "p99": "2001.10ms",
   "scoring": {
     "breakdown": {
       "false_positive_detections": 0,
-      "false_negative_detections": 1,
-      "true_positive_detections": 11138,
-      "true_negative_detections": 14043,
-      "http_errors": 0
+      "false_negative_detections": 0,
+      "true_positive_detections": 594,
+      "true_negative_detections": 667,
+      "http_errors": 46879
     },
-    "failure_rate": "0%",
-    "weighted_errors_E": 3,
-    "error_rate_epsilon": 0.000119,
-    "p99_score": {
-      "value": -77.08,
-      "cut_triggered": false
-    },
-    "detection_score": {
-      "value": 2819.38,
-      "rate_component": 3000,
-      "absolute_penalty": -180.62,
-      "cut_triggered": false
-    },
-    "final_score": 2742.3
+    "failure_rate": "97.38%",
+    "p99_score": { "value": -3000, "cut_triggered": true },
+    "detection_score": { "value": -3000, "cut_triggered": true },
+    "final_score": -6000
   }
 }
 ```
 
-Detecção praticamente perfeita. A latência é toda a distância entre nós e o
-topo do ranking — é o que o `v2` em diante vai atacar.
+**O que isto nos diz:**
+
+- O laptop estava a inflar a v1 por ~10×. A realidade é mais dura.
+- A lógica de detecção continua perfeita: dos 1 261 requests servidos com
+  sucesso tivemos **0 FP, 0 FN**.
+- Capacidade ≈ 2 instâncias × 10 req/s = 20 req/s. O teste do k6 sobe até
+  900 req/s — 45× a nossa capacidade → cascata de timeouts → ambos os
+  cortes da rinha disparam.
+- Para sobreviver, **cada request tem de cair de ~100 ms para ~2–3 ms**
+  (≈25× de speedup).
+- Vector API sozinha dá 30–50%. Quantização int8 dá 4–8×. Partição coarse
+  com k-means dá 10–20×. Vamos precisar de uma combinação.
