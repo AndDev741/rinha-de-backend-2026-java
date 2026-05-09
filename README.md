@@ -3,45 +3,43 @@
 > **🇬🇧 [English](#english) · 🇧🇷 [Português](#português)**
 
 > **Branch strategy:** each major step lives on its own branch (`v1`, `v2`,
-> `v3`, ...). The final submission lives on `main`. This branch is **`v4`** —
-> int8 quantization of the dataset (168 MB → 42 MB) so we finally fit
-> inside the rinha 350 MB total budget.
+> `v3`, ...). The final submission lives on `main`. This branch is **`v5`** —
+> IVF (Inverted File) coarse k-means partitioning. **First positive
+> Docker score: +2600.82.**
 
 ---
 
 ## English
 
-In `v4` we replace v1-v3's heap-resident `float[3M*14]` (168 MB) with an
-int8 quantized `byte[3M*14]` (42 MB). The dataset now fits **with margin**
-inside the rinha 350 MB budget (2 instances × 160 MB + nginx 30 MB = 350 MB
-exact). Distance compute uses a hybrid path: byte storage with on-the-fly
-B→F SIMD widening, so we keep FMA-friendly float arithmetic for the inner
-loop while reading 4× less memory.
+In `v5` we replace brute force with **IVF (Inverted File Index)**: a coarse
+k-means partition over the 3M reference vectors into K=256 clusters. At
+query time we (1) compute distance to all K centroids, (2) pick the
+NPROBE=3 nearest clusters, and (3) brute-force the v4 hybrid SIMD distance
+only inside those clusters. The brute-force loop drops from 3M ×
+to ~36k × — a roughly 80× reduction in inner-loop work.
 
 **Findings:**
-- ✅ **Memory budget solved.** First version that fits the rinha rules.
-- ✅ **Detection still excellent.** Parity test: 95% fraud_score agreement
-  with float32 ground truth on synthetic uniform data (the worst case).
-  Real Docker run: only 2 errors out of 668 served = 0.3% misclass.
-- ❌ **No throughput gain on this machine.** Pure-int math (B→I, mul) was
-  slower than v3 vector because VPMULLD has worse throughput than VFMADD on
-  Haswell. The hybrid B→F path is comparable to v3 vector on compute, and
-  the memory bandwidth advantage doesn't dominate under 1 vCPU shared
-  scheduling. Score remains −6000 in Docker.
-- 📌 **The real bottleneck has shifted.** With memory under control, the
-  remaining cost is the brute-force loop itself: 3M × 14 = 42M operations
-  per request. At 1 ns/op that's 42 ms — beyond the 1-vCPU budget for
-  900 req/s. Algorithmic optimization (k-means partitioning) is now the
-  critical move.
+- 🎯 **First positive Docker score: +2600.82** (was −6000 in v4).
+- 🎯 **p99 dropped from 2001 ms (cutoff) to 88 ms.** A ~23× speedup
+  per request, on the same hardware, same memory budget.
+- ✅ **Detection is approximate but acceptable.** IVF can miss true top-5
+  neighbors that straddle cluster boundaries. With NPROBE=3 we trade
+  a detection_score reduction (~+1547 of max +3000) for a giant p99 win
+  (+1054 of max +3000).
+- ✅ **Still fits the 350 MB rinha budget** (inherited from v4).
+- 📌 **Where headroom remains:** detection still has ~+1300 left if we
+  tune NPROBE up; p99 has ~+2000 if we move to a native binary that kills
+  JIT warmup and tightens memory layout.
 
 ### Roadmap (current)
 
 1. ✅ **`v1`** — scalar baseline on the host JVM (final score: +2742)
 2. ✅ **`v2`** — Docker stack + nginx LB + cgroup limits (final score: −6000)
 3. ✅ **`v3`** — Vector API SIMD with KNN_MODE A/B (host: +2726, Docker: −6000)
-4. ✅ **`v4` (this branch)** — int8 storage + hybrid B→F SIMD (Docker fits 350 MB, score: −6000)
-5. **`v5`** — coarse k-means partitioning (target: scan 5% of vectors → sub-10ms p99)
-6. **`v6`** — GraalVM `native-image` (kill warmup + slim RSS for the final submission)
+4. ✅ **`v4`** — int8 storage + hybrid B→F SIMD (Docker fits 350 MB, score: −6000)
+5. ✅ **`v5` (this branch)** — IVF coarse k-means (Docker: **+2600.82**, p99 88 ms)
+6. **`v6`** — GraalVM `native-image` (target: kill warmup, ~30-50 % p99 cut, push score above +3000)
+7. (optional) **`v7`** — NPROBE tuning, residual quantization, or smaller-K experiments
 
 Each branch is self-contained and lets us compare scores side-by-side as we
 evolve the solution.
@@ -66,13 +64,16 @@ rinha-de-backend-andre-java/
 │   │   └── JsonReader.java              # hand-rolled parser
 │   ├── vector/
 │   │   ├── Vectorizer.java              # 14 dimensions + clamp
-│   │   ├── Dataset.java                 # mmap → byte[] (int8) + scales
-│   │   └── KnnSearcher.java             # brute force + max-heap
+│   │   ├── Dataset.java                 # mmap → byte[] (int8) + scales + centroids + offsets
+│   │   ├── KnnSearcher.java             # IVF: centroid search + bucket scan
+│   │   └── KMeans.java                  # Lloyd's + k-means++ (build-time only)
 │   └── prep/
-│       └── DatasetBuilder.java          # CLI: references.json.gz → vectors-i8.bin + scales.bin
+│       └── DatasetBuilder.java          # CLI: json.gz → int8 + scales + centroids + offsets
 └── src/test/java/...
     ├── JsonReaderTest.java
-    └── VectorizerTest.java
+    ├── VectorizerTest.java
+    ├── KnnSearcherInt8ParityTest.java   # v4: int8 vs float32 ground truth
+    └── KnnSearcherIvfRecallTest.java    # v5: IVF recall vs brute-force
 ```
 
 ---
@@ -365,48 +366,121 @@ comparisons**, not faster ones.
 That's `v5`'s job (coarse k-means partitioning).
 
 ---
+
+### v5 results — IVF k-means partitioning
+
+K=256 clusters, NPROBE=3 (search the 3 nearest clusters per query),
+~12k average vectors per cluster.
+
+#### Cluster diagnostics (build-time)
+
+```
+[builder] cluster size: min=554 max=37662 mean=11718 empty=0
+```
+
+K-means converged at iter 19 with 0.6 % reassignments per iteration
+(stopped at the 20-iter cap; could push lower with more iters but the
+clusters are stable).
+
+#### Host (no limits)
+
+| Metric | v4 hybrid | v5 IVF | Δ |
+|---|---|---|---|
+| served | 14 307 | **54 059** | +278 % |
+| p99 | 2002 ms | **2.26 ms** | **−885×** |
+| failure | 56.86 % | 0.26 % | — |
+| **final_score** | **−6000** | **+4193.11** | **+10193** |
+
+#### Docker (1 vCPU split, 350 MB total — rinha rules)
+
+| Run | served | p99 | failure | final_score |
+|---|---|---|---|---|
+| v2 raw      | 1 261  | 2001 ms | 97.38% | −6000 |
+| v3 vector   | 1 188  | 2001 ms | 97.54% | −6000 |
+| v4 hybrid   | 668    | 2001 ms | 98.62% | −6000 |
+| **v5 IVF**  | **53 891** | **88 ms** | **0.26%** | **+2600.82** |
+
+Detailed v5 Docker breakdown:
+
+```json
+{
+  "p99": "88.32ms",
+  "scoring": {
+    "breakdown": {
+      "false_positive_detections": 72,
+      "false_negative_detections": 70,
+      "true_positive_detections": 23953,
+      "true_negative_detections": 29938,
+      "http_errors": 0
+    },
+    "failure_rate": "0.26%",
+    "p99_score":         { "value": 1053.95, "cut_triggered": false },
+    "detection_score":   { "value": 1546.87, "cut_triggered": false },
+    "final_score": 2600.82
+  }
+}
+```
+
+#### Why this works
+
+- **80× fewer comparisons.** v4 brute-forces 3M × 14 = 42 M ops per request.
+  v5 does 256 × 14 (centroids) + 3 × ~12k × 14 (buckets) ≈ 510 k ops. The
+  inner loop time drops from ~50 ms to ~0.5 ms.
+- **Same memory budget.** Centroids add 14 KB (256 × 14 × 4 B), offsets
+  add 1 KB. Negligible vs the 42 MB int8 dataset.
+- **Detection cost is real but bounded.** 142 misclassifications out of
+  ~54 k served (0.26 %) come from queries near cluster boundaries
+  whose true top-5 spans more than 3 clusters. Tuning NPROBE up trades
+  p99 for recall.
+
+#### What's left
+
+- **Detection has +1273 of headroom** (current +1547, max 3000). NPROBE=5
+  or 7 could recover most of this if the p99 budget allows.
+- **p99 has +1947 of headroom** (current +1054, max 3000). v6 (GraalVM
+  native) should kill JIT warmup variance and tighten layout further.
+- **Combined v5+v6 target: +4500–5000.**
+
+---
 ---
 
 ## Português
 
 > **Estratégia de branches:** cada passo grande vive numa branch própria
 > (`v1`, `v2`, `v3`, ...). A submissão final vive em `main`. Esta branch
-> é a **`v4`** — quantização int8 do dataset (168 MB → 42 MB) para
-> finalmente caber no orçamento de 350 MB da rinha.
+> é a **`v5`** — IVF (Inverted File) com partição coarse via k-means.
+> **Primeiro score positivo em Docker: +2600.82.**
 
-Na `v4` substituímos o `float[3M*14]` heap-resident (168 MB) das v1–v3 por
-um `byte[3M*14]` quantizado em int8 (42 MB). O dataset agora cabe **com
-folga** dentro do orçamento de 350 MB da rinha (2 instâncias × 160 MB +
-nginx 30 MB = 350 MB exactos). O cálculo da distância usa um caminho
-híbrido: storage em byte com widening B→F SIMD on-the-fly, mantendo a
-aritmética float com FMA do v3 mas lendo 4× menos memória.
+Na `v5` substituímos o brute force pelo **IVF (Inverted File Index)**:
+uma partição coarse via k-means dos 3M vetores de referência em K=256
+clusters. Em query time (1) calculamos distância da query aos K centróides,
+(2) escolhemos os NPROBE=3 clusters mais próximos, e (3) fazemos brute
+force SIMD híbrido (do v4) só dentro desses clusters. O loop de brute
+force cai de 3M × para ~36k × — uma redução de ~80× no trabalho do
+inner loop.
 
 **Resultados:**
-- ✅ **Orçamento de memória resolvido.** Primeira versão que cabe nas
-  regras da rinha.
-- ✅ **Detecção continua excelente.** Teste de paridade: 95% de
-  concordância no fraud_score contra ground truth float32 em dados
-  uniformes sintéticos (pior caso). Run real Docker: só 2 erros em
-  668 servidos = 0.3% de misclass.
-- ❌ **Sem ganho de throughput nesta máquina.** Math em int puro (B→I,
-  mul) ficou mais lento que v3 vector porque VPMULLD tem throughput
-  pior que VFMADD em Haswell. O caminho híbrido B→F ficou igual a v3
-  vector em compute, e a vantagem de bandwidth não domina sob 1 vCPU
-  partilhada. Score continua −6000 em Docker.
-- 📌 **O verdadeiro gargalo mudou.** Com a memória sob controlo, o que
-  resta é o brute-force em si: 3M × 14 = 42M ops por request. A 1 ns/op
-  isso dá 42 ms — para lá do orçamento de 1 vCPU para 900 req/s.
-  Optimização algorítmica (k-means partitioning) é a próxima jogada
-  crítica.
+- 🎯 **Primeiro score positivo em Docker: +2600.82** (era −6000 em v4).
+- 🎯 **p99 caiu de 2001 ms (cutoff) para 88 ms.** Speedup de ~23× por
+  request, no mesmo hardware, mesmo orçamento de memória.
+- ✅ **Detecção é aproximada mas aceitável.** IVF pode falhar top-5
+  reais que cruzam fronteiras de cluster. Com NPROBE=3 trocamos
+  redução do detection_score (~+1547 do máximo +3000) por um ganho
+  enorme em p99 (+1054 do máximo +3000).
+- ✅ **Continua a caber no orçamento de 350 MB** (herdado da v4).
+- 📌 **Onde resta margem:** detection tem ~+1300 disponíveis se
+  subirmos NPROBE; p99 tem ~+2000 que um binário nativo (que mata
+  warmup do JIT e aperta layout) pode capturar.
 
 ### Roadmap (atual)
 
 1. ✅ **`v1`** — baseline scalar na JVM do host (final score: +2742)
 2. ✅ **`v2`** — Docker stack + nginx LB + cgroup limits (final score: −6000)
 3. ✅ **`v3`** — Vector API SIMD com KNN_MODE A/B (host: +2726, Docker: −6000)
-4. ✅ **`v4` (esta branch)** — int8 storage + híbrido B→F SIMD (Docker cabe em 350 MB, score: −6000)
-5. **`v5`** — partição coarse com k-means (alvo: comparar 5% dos vetores → p99 sub-10ms)
-6. **`v6`** — GraalVM `native-image` (mata warmup + corta RSS para a submissão final)
+4. ✅ **`v4`** — int8 storage + híbrido B→F SIMD (Docker cabe em 350 MB, score: −6000)
+5. ✅ **`v5` (esta branch)** — IVF coarse k-means (Docker: **+2600.82**, p99 88 ms)
+6. **`v6`** — GraalVM `native-image` (alvo: matar warmup, cortar p99 30-50%, score acima de +3000)
+7. (opcional) **`v7`** — tuning de NPROBE, residual quantization ou experiências com K menor
 
 ---
 
@@ -428,13 +502,16 @@ rinha-de-backend-andre-java/
 │   │   └── JsonReader.java              # parser manual
 │   ├── vector/
 │   │   ├── Vectorizer.java              # 14 dimensões + clamp
-│   │   ├── Dataset.java                 # mmap → byte[] (int8) + scales
-│   │   └── KnnSearcher.java             # brute force + max-heap
+│   │   ├── Dataset.java                 # mmap → byte[] (int8) + scales + centroids + offsets
+│   │   ├── KnnSearcher.java             # IVF: centroid search + bucket scan
+│   │   └── KMeans.java                  # Lloyd's + k-means++ (build-time only)
 │   └── prep/
-│       └── DatasetBuilder.java          # CLI: references.json.gz → vectors-i8.bin + scales.bin
+│       └── DatasetBuilder.java          # CLI: json.gz → int8 + scales + centroids + offsets
 └── src/test/java/...
     ├── JsonReaderTest.java
-    └── VectorizerTest.java
+    ├── VectorizerTest.java
+    ├── KnnSearcherInt8ParityTest.java   # v4: int8 vs float32 ground truth
+    └── KnnSearcherIvfRecallTest.java    # v5: IVF recall vs brute-force
 ```
 
 ---
@@ -703,3 +780,81 @@ O speedup de 20× restante tem de vir de **menos comparações**, não de
 comparações mais rápidas.
 
 Esse é o trabalho da `v5` (partição coarse com k-means).
+
+---
+
+### Resultados da v5 — IVF k-means
+
+K=256 clusters, NPROBE=3 (busca os 3 mais próximos), ~12k vetores médios
+por cluster.
+
+#### Diagnóstico de clusters (build-time)
+
+```
+[builder] cluster size: min=554 max=37662 mean=11718 empty=0
+```
+
+K-means convergiu na iter 19 com 0.6% reassignments por iteração
+(parou no cap de 20 iters; podia ir mais baixo com mais iters mas os
+clusters já estão estáveis).
+
+#### Host (sem limites)
+
+| Métrica | v4 hybrid | v5 IVF | Δ |
+|---|---|---|---|
+| servidos | 14 307 | **54 059** | +278 % |
+| p99 | 2002 ms | **2.26 ms** | **−885×** |
+| falha | 56.86 % | 0.26 % | — |
+| **final_score** | **−6000** | **+4193.11** | **+10193** |
+
+#### Docker (1 vCPU dividida, 350 MB total — regras da rinha)
+
+| Run | servidos | p99 | falha | final_score |
+|---|---|---|---|---|
+| v2 raw      | 1 261  | 2001 ms | 97.38% | −6000 |
+| v3 vector   | 1 188  | 2001 ms | 97.54% | −6000 |
+| v4 hybrid   | 668    | 2001 ms | 98.62% | −6000 |
+| **v5 IVF**  | **53 891** | **88 ms** | **0.26%** | **+2600.82** |
+
+Breakdown detalhado da v5 Docker:
+
+```json
+{
+  "p99": "88.32ms",
+  "scoring": {
+    "breakdown": {
+      "false_positive_detections": 72,
+      "false_negative_detections": 70,
+      "true_positive_detections": 23953,
+      "true_negative_detections": 29938,
+      "http_errors": 0
+    },
+    "failure_rate": "0.26%",
+    "p99_score":         { "value": 1053.95, "cut_triggered": false },
+    "detection_score":   { "value": 1546.87, "cut_triggered": false },
+    "final_score": 2600.82
+  }
+}
+```
+
+#### Por que funciona
+
+- **80× menos comparações.** v4 brute-force faz 3M × 14 = 42M ops por
+  request. v5 faz 256 × 14 (centróides) + 3 × ~12k × 14 (buckets)
+  ≈ 510k ops. O inner loop cai de ~50 ms para ~0.5 ms.
+- **Mesmo orçamento de memória.** Centróides adicionam 14 KB
+  (256 × 14 × 4 B), offsets adicionam 1 KB. Negligível vs os 42 MB
+  do dataset int8.
+- **Custo de detecção é real mas limitado.** 142 misclassifications em
+  ~54 k servidos (0.26%) vêm de queries perto de fronteiras de
+  cluster cujo top-5 real cruza mais de 3 clusters. Tunar NPROBE
+  para cima troca p99 por recall.
+
+#### O que sobra
+
+- **Detection tem +1273 de margem** (atual +1547, máximo 3000).
+  NPROBE=5 ou 7 pode recuperar a maior parte se p99 permitir.
+- **p99 tem +1947 de margem** (atual +1054, máximo 3000). v6
+  (GraalVM nativo) deve matar variância do JIT warmup e apertar
+  layout.
+- **Alvo combinado v5+v6: +4500–5000.**

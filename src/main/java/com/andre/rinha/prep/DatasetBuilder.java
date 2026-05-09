@@ -1,5 +1,7 @@
 package com.andre.rinha.prep;
 
+import com.andre.rinha.vector.KMeans;
+
 import java.io.BufferedInputStream;
 import java.io.DataOutputStream;
 import java.io.FileInputStream;
@@ -60,6 +62,13 @@ public final class DatasetBuilder {
     private static final int DIMS = 14;
     private static final int LOG_EVERY = 1_000_000;
 
+    /** v5: number of clusters for IVF coarse partitioning. */
+    private static final int K_CLUSTERS = 256;
+    /** v5: max iterations for Lloyd's k-means. */
+    private static final int KMEANS_MAX_ITERS = 20;
+    /** v5: deterministic seed so the dataset build is reproducible. */
+    private static final long KMEANS_SEED = 42L;
+
     /**
      * Initial capacity for the streaming buffer. The official dataset is 3M
      * but we don't hardcode — we grow geometrically if the input exceeds.
@@ -75,10 +84,12 @@ public final class DatasetBuilder {
         Path outDir = Path.of(args[1]);
         outDir.toFile().mkdirs();
 
-        Path vectorsPath = outDir.resolve("vectors-i8.bin");
-        Path scalesPath  = outDir.resolve("scales.bin");
-        Path labelsPath  = outDir.resolve("labels.bin");
-        Path metaPath    = outDir.resolve("meta.txt");
+        Path vectorsPath   = outDir.resolve("vectors-i8.bin");
+        Path scalesPath    = outDir.resolve("scales.bin");
+        Path labelsPath    = outDir.resolve("labels.bin");
+        Path centroidsPath = outDir.resolve("centroids.bin");
+        Path offsetsPath   = outDir.resolve("cluster_offsets.bin");
+        Path metaPath      = outDir.resolve("meta.txt");
 
         long t0 = System.currentTimeMillis();
         System.out.println("[builder] reading " + input);
@@ -209,11 +220,70 @@ public final class DatasetBuilder {
             }
         }
 
-        // Free the big float[] so the writes that follow don't bloat heap.
+        // ---- Pass 4 (v5): k-means clustering for IVF ----
+        //
+        // We cluster on the FLOAT vectors (not int8). Why: clustering quality
+        // matters more than uniformity with the rest of the pipeline; using
+        // float gives better centroid placement, which directly affects
+        // search recall. The int8 vectors we already built will be reordered
+        // by cluster afterwards.
+        System.out.printf("%n[builder] running k-means: K=%d, max_iters=%d, seed=%d%n",
+                K_CLUSTERS, KMEANS_MAX_ITERS, KMEANS_SEED);
+        long tKmeans = System.currentTimeMillis();
+        KMeans.Result km = KMeans.fit(vectorsF, count, DIMS, K_CLUSTERS,
+                                       KMEANS_MAX_ITERS, KMEANS_SEED);
+        System.out.printf("[builder] k-means done in %.1fs (%d iterations)%n",
+                (System.currentTimeMillis() - tKmeans) / 1000.0, km.iterations());
+
+        // Free the big float[] now that k-means is done — we still have to
+        // do the reorder + writes, and 168 MB of floats no longer needs to
+        // live in heap.
         vectorsF = null;
 
+        // ---- Pass 5 (v5): reorder vectors and labels by cluster ----
+        //
+        // After this step, vectors-i8.bin and labels.bin look like:
+        //   [all vectors of cluster 0][all vectors of cluster 1]...[all vectors of cluster K-1]
+        // The cluster_offsets.bin file gives the inclusive start and exclusive
+        // end of each cluster, so KnnSearcher can scan a cluster as a
+        // contiguous range — perfect for cache locality and simple SIMD.
+        int[] assignments = km.assignments();
+
+        int[] counts = new int[K_CLUSTERS];
+        for (int a : assignments) counts[a]++;
+
+        int[] offsets = new int[K_CLUSTERS + 1];
+        for (int c = 0; c < K_CLUSTERS; c++) offsets[c + 1] = offsets[c] + counts[c];
+
+        // Histogram diagnostic — helps spot pathological cluster imbalance.
+        int minCluster = Integer.MAX_VALUE;
+        int maxCluster = 0;
+        int emptyCount = 0;
+        for (int n : counts) {
+            if (n == 0) emptyCount++;
+            if (n < minCluster) minCluster = n;
+            if (n > maxCluster) maxCluster = n;
+        }
+        System.out.printf("[builder] cluster size: min=%d max=%d mean=%d empty=%d%n",
+                minCluster, maxCluster, count / K_CLUSTERS, emptyCount);
+
+        // Allocate the new layout. We use a working write-position copy of
+        // offsets so we can fill in place.
+        byte[] reorderedVecs = new byte[count * DIMS];
+        BitSet reorderedLabels = new BitSet(count);
+        int[] writePos = offsets.clone();
+        for (int oldIdx = 0; oldIdx < count; oldIdx++) {
+            int c = assignments[oldIdx];
+            int newIdx = writePos[c]++;
+            System.arraycopy(vectorsI8, oldIdx * DIMS, reorderedVecs, newIdx * DIMS, DIMS);
+            if (labels.get(oldIdx)) reorderedLabels.set(newIdx);
+        }
+        // Free original (unreordered) byte[] now.
+        vectorsI8 = null;
+        labels = null;
+
         // ---- Write output files ----
-        Files.write(vectorsPath, vectorsI8);
+        Files.write(vectorsPath, reorderedVecs);
 
         ByteBuffer scalesBuf = ByteBuffer
                 .allocate((mins.length + maxs.length) * 4)
@@ -222,12 +292,11 @@ public final class DatasetBuilder {
         for (float m : maxs) scalesBuf.putFloat(m);
         Files.write(scalesPath, scalesBuf.array());
 
-        // Labels — BitSet → packed bytes, little-endian-ish bit order matching
-        // the v3/v2 reader (bit i = bit (i % 8) of byte (i / 8)).
+        // Labels — BitSet → packed bytes, bit order matches v2/v3/v4 readers.
         int byteCount = (count + 7) / 8;
         byte[] labelBytes = new byte[byteCount];
         for (int i = 0; i < count; i++) {
-            if (labels.get(i)) {
+            if (reorderedLabels.get(i)) {
                 labelBytes[i / 8] |= (byte) (1 << (i % 8));
             }
         }
@@ -235,13 +304,34 @@ public final class DatasetBuilder {
             out.write(labelBytes);
         }
 
-        Files.writeString(metaPath, "count=" + count + "\nfraud=" + fraudCount + "\n");
+        // Centroids — flat float32 LE, shape [K * DIMS].
+        ByteBuffer centBuf = ByteBuffer
+                .allocate(K_CLUSTERS * DIMS * 4)
+                .order(ByteOrder.LITTLE_ENDIAN);
+        for (float v : km.centroids()) centBuf.putFloat(v);
+        Files.write(centroidsPath, centBuf.array());
 
-        System.out.printf("[builder] OK: %d vectors, %d frauds (%.2f%%) in %.1fs%n",
+        // Cluster offsets — int32 LE, length K+1.
+        ByteBuffer offBuf = ByteBuffer
+                .allocate((K_CLUSTERS + 1) * 4)
+                .order(ByteOrder.LITTLE_ENDIAN);
+        for (int o : offsets) offBuf.putInt(o);
+        Files.write(offsetsPath, offBuf.array());
+
+        Files.writeString(metaPath,
+                "count=" + count + "\n"
+              + "fraud=" + fraudCount + "\n"
+              + "k=" + K_CLUSTERS + "\n"
+              + "kmeans_iters=" + km.iterations() + "\n"
+              + "cluster_min=" + minCluster + "\n"
+              + "cluster_max=" + maxCluster + "\n");
+
+        System.out.printf("%n[builder] OK: %d vectors, %d frauds (%.2f%%) in %.1fs%n",
                 count, fraudCount, fraudCount * 100.0 / count,
                 (System.currentTimeMillis() - t0) / 1000.0);
-        System.out.printf("[builder] sizes: vectors-i8.bin=%d  scales.bin=%d  labels.bin=%d%n",
-                Files.size(vectorsPath), Files.size(scalesPath), Files.size(labelsPath));
+        System.out.printf("[builder] sizes: vectors-i8=%d  scales=%d  labels=%d  centroids=%d  offsets=%d%n",
+                Files.size(vectorsPath), Files.size(scalesPath), Files.size(labelsPath),
+                Files.size(centroidsPath), Files.size(offsetsPath));
     }
 
     /* -------------------- Minimal streaming JSON tokenizer -------------------- */

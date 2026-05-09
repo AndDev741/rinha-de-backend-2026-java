@@ -98,7 +98,15 @@ class KnnSearcherInt8ParityTest {
             }
         }
 
-        Dataset int8Dataset = Dataset.fromArrays(vectorsI8, labels, mins, maxs);
+        // v5 Dataset requires centroids + cluster offsets. For this test
+        // (which validates int8 quantization correctness, not IVF recall) we
+        // pass a trivial single-cluster partition: all N vectors live in
+        // cluster 0, so the IVF search degenerates to brute force over the
+        // whole dataset. That's exactly what we want for a quantization test.
+        float[] trivialCentroid = new float[DIMS]; // zeros — irrelevant with 1 cluster
+        int[] trivialOffsets = new int[]{ 0, N };
+        Dataset int8Dataset = Dataset.fromArrays(
+                vectorsI8, labels, mins, maxs, trivialCentroid, trivialOffsets);
         KnnSearcher int8Searcher = new KnnSearcher(int8Dataset);
 
         // Run the comparison.
