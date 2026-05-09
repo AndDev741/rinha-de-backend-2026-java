@@ -12,18 +12,18 @@ import java.util.Random;
 import java.util.concurrent.Executors;
 
 /**
- * Entry point.
+ * Entry point — v4 (int8 quantized dataset).
  *
  * Environment variables:
  *   PORT      — HTTP port (default 9999, as required by the challenge)
- *   DATA_DIR  — directory containing vectors.bin + labels.bin (default ./data)
+ *   DATA_DIR  — directory containing vectors-i8.bin + scales.bin + labels.bin
+ *               (default ./data)
  *   THREADS   — HttpServer thread pool size (default = number of CPUs)
  *
- * Initialization order matters:
- *   1. Load the dataset FIRST. Takes ~3-10s for 168MB of data.
- *   2. Only then bind/start the socket.
- *   3. /ready only responds once we get here — the load balancer detects
- *      readiness automatically.
+ * Initialization order:
+ *   1. Load the int8 dataset (~42 MB instead of v1-v3's ~168 MB float32).
+ *   2. JIT warmup over the int8 hot path.
+ *   3. Bind and start. /ready only responds once we reach this point.
  */
 public final class App {
 
@@ -32,15 +32,15 @@ public final class App {
         Path dataDir = Path.of(env("DATA_DIR", "./data"));
         int threads = envInt("THREADS", Runtime.getRuntime().availableProcessors());
 
+        System.out.println("[app] SIMD: " + KnnSearcher.simdInfo());
+
         long t0 = System.currentTimeMillis();
-        System.out.println("[app] loading dataset from " + dataDir.toAbsolutePath());
+        System.out.println("[app] loading int8 dataset from " + dataDir.toAbsolutePath());
         Dataset dataset = Dataset.load(dataDir);
         long loadMs = System.currentTimeMillis() - t0;
-        System.out.printf("[app] dataset loaded: %d vectors in %d ms%n",
-                dataset.count(), loadMs);
+        System.out.printf("[app] dataset loaded: %d vectors in %d ms (%.1f MB heap)%n",
+                dataset.count(), loadMs, dataset.vectors().length / (1024.0 * 1024.0));
 
-        // Minimal JIT warmup: runs a dummy search so the first real request
-        // doesn't pay the cost of compilation.
         warmup(dataset);
 
         HttpServer server = HttpServer.create(new InetSocketAddress(port), 0);
@@ -62,8 +62,9 @@ public final class App {
     private static void warmup(Dataset ds) {
         var searcher = new KnnSearcher(ds);
         float[] q = new float[Dataset.DIMS];
-        Random rng = new java.util.Random(42);
+        Random rng = new Random(42);
         for (int i = 0; i < 1000; i++) {
+            // Random floats in [0, 1] — matches Vectorizer output range.
             for (int j = 0; j < q.length; j++) q[j] = rng.nextFloat();
             searcher.fraudScore(q);
         }

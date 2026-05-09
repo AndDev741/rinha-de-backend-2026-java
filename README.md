@@ -3,32 +3,45 @@
 > **🇬🇧 [English](#english) · 🇧🇷 [Português](#português)**
 
 > **Branch strategy:** each major step lives on its own branch (`v1`, `v2`,
-> `v3`, ...). The final submission lives on `main`. This branch is **`v2`** —
-> the realistic-constraints stack: Docker Compose, nginx LB, two API replicas,
-> with the rinha CPU/memory budget.
+> `v3`, ...). The final submission lives on `main`. This branch is **`v4`** —
+> int8 quantization of the dataset (168 MB → 42 MB) so we finally fit
+> inside the rinha 350 MB total budget.
 
 ---
 
 ## English
 
-In `v2` we package the v1 code into a real submission-shaped stack and run
-the official k6 test under the actual rinha environment (1 vCPU + 350 MB
-total). We add **no algorithmic changes**: the goal is to learn what the
-realistic constraints look like.
+In `v4` we replace v1-v3's heap-resident `float[3M*14]` (168 MB) with an
+int8 quantized `byte[3M*14]` (42 MB). The dataset now fits **with margin**
+inside the rinha 350 MB budget (2 instances × 160 MB + nginx 30 MB = 350 MB
+exact). Distance compute uses a hybrid path: byte storage with on-the-fly
+B→F SIMD widening, so we keep FMA-friendly float arithmetic for the inner
+loop while reading 4× less memory.
 
-**Spoiler:** v1's heap-resident dataset doesn't fit in two containers under
-350 MB. Even with relaxed memory we hit a 1-vCPU wall: each request is
-~50–200 ms, the test ramps to 900 req/s, the p99 cutoff fires. Score: **−6000**.
-That's the lesson — and it's what `v3` onward will fix with real numbers.
+**Findings:**
+- ✅ **Memory budget solved.** First version that fits the rinha rules.
+- ✅ **Detection still excellent.** Parity test: 95% fraud_score agreement
+  with float32 ground truth on synthetic uniform data (the worst case).
+  Real Docker run: only 2 errors out of 668 served = 0.3% misclass.
+- ❌ **No throughput gain on this machine.** Pure-int math (B→I, mul) was
+  slower than v3 vector because VPMULLD has worse throughput than VFMADD on
+  Haswell. The hybrid B→F path is comparable to v3 vector on compute, and
+  the memory bandwidth advantage doesn't dominate under 1 vCPU shared
+  scheduling. Score remains −6000 in Docker.
+- 📌 **The real bottleneck has shifted.** With memory under control, the
+  remaining cost is the brute-force loop itself: 3M × 14 = 42M operations
+  per request. At 1 ns/op that's 42 ms — beyond the 1-vCPU budget for
+  900 req/s. Algorithmic optimization (k-means partitioning) is now the
+  critical move.
 
-### Roadmap (revised in v2)
+### Roadmap (current)
 
-1. ✅ **`v1`** — scalar baseline, no infra, run on host JVM (final score: +2742)
-2. ✅ **`v2` (this branch)** — Docker stack + nginx LB + cgroup limits (final score: −6000)
-3. **`v3`** — SIMD via `jdk.incubator.vector` (Vector API)
-4. **`v4`** — int8 quantization of the dataset (168 MB → 42 MB)
-5. **`v5`** — GraalVM `native-image` (kill warmup + slim RSS)
-6. (optional) **`v6`** — coarse k-means partitioning (sub-ms p99)
+1. ✅ **`v1`** — scalar baseline on the host JVM (final score: +2742)
+2. ✅ **`v2`** — Docker stack + nginx LB + cgroup limits (final score: −6000)
+3. ✅ **`v3`** — Vector API SIMD with KNN_MODE A/B (host: +2726, Docker: −6000)
+4. ✅ **`v4` (this branch)** — int8 storage + hybrid B→F SIMD (Docker fits 350 MB, score: −6000)
+5. **`v5`** — coarse k-means partitioning (target: scan 5% of vectors → sub-10ms p99)
+6. **`v6`** — GraalVM `native-image` (kill warmup + slim RSS for the final submission)
 
 Each branch is self-contained and lets us compare scores side-by-side as we
 evolve the solution.
@@ -53,10 +66,10 @@ rinha-de-backend-andre-java/
 │   │   └── JsonReader.java              # hand-rolled parser
 │   ├── vector/
 │   │   ├── Vectorizer.java              # 14 dimensions + clamp
-│   │   ├── Dataset.java                 # mmap → float[]
+│   │   ├── Dataset.java                 # mmap → byte[] (int8) + scales
 │   │   └── KnnSearcher.java             # brute force + max-heap
 │   └── prep/
-│       └── DatasetBuilder.java          # CLI: references.json.gz → vectors.bin
+│       └── DatasetBuilder.java          # CLI: references.json.gz → vectors-i8.bin + scales.bin
 └── src/test/java/...
     ├── JsonReaderTest.java
     └── VectorizerTest.java
@@ -172,9 +185,10 @@ java -cp target/classes \
 ```
 
 Files in `data/`:
-- `vectors.bin` — ~161 MB
-- `labels.bin`  — ~367 KB
-- `meta.txt`    — sanity check
+- `vectors-i8.bin` — 42 MB (int8 quantized vectors)
+- `scales.bin`     — 112 B (global mins[14] + maxs[14] in float32 LE)
+- `labels.bin`     — ~367 KB
+- `meta.txt`       — sanity check
 
 #### 4. Run the app on the host
 
@@ -305,34 +319,94 @@ generous host.
   k-means partitioning gets 10–20×. We'll need a stack of these.
 
 ---
+
+### v4 results — int8 quantization
+
+#### Host (no limits)
+
+| Run | served | p99 | failure | final_score |
+|---|---|---|---|---|
+| v3 vector | 24 424 | 1241 ms | 0% | **+2726** |
+| v4 hybrid | 14 307 | 2002 ms | 56.86% | **−6000** |
+
+v4 is *slower* on the host: the B→F SIMD widening adds compute that doesn't
+pay back on a machine with abundant memory bandwidth. v3 wins here.
+
+#### Docker (1 vCPU split, 350 MB total — rinha rules)
+
+| Run | served | p99 | failure | final_score |
+|---|---|---|---|---|
+| v2 raw      | 1 261 | 2001 ms | 97.38% | −6000 |
+| v3 scalar   | 1 605 | 2001 ms | 96.65% | −6000 |
+| v3 vector   | 1 188 | 2001 ms | 97.54% | −6000 |
+| v4 hybrid   | 668   | 2001 ms | 98.62% | −6000 |
+
+#### What v4 actually achieved
+
+- ✅ **Memory budget solved.** v1-v3 needed 240 MB heap per instance; v4 fits
+  in 80 MB (dataset 42 MB + JVM ~30 MB). Two instances + nginx finally fit
+  exactly in the 350 MB rinha rule. The Docker compose now ships honest
+  limits (160 MB / api, 30 MB / nginx).
+- ✅ **Detection still excellent.** 1 FP and 1 FN out of 668 served = 0.3%
+  misclass on Docker. Parity test confirms ≥95% fraud_score agreement with
+  float32 ground truth on synthetic uniform data (a worst case).
+- ❌ **No throughput gain.** All four configs hit the same p99 cutoff floor
+  under 1 vCPU. The int8 dataset reads 4× less memory but compute is
+  per-request bound regardless of data size.
+
+#### Where the bottleneck has moved
+
+We're no longer memory-bound. We're now bound by the **brute-force loop
+itself**: 3M vectors × 14 dims = 42 M ops per request. At even 1 ns/op
+that's 42 ms — and we have ~2 ms budget per request to make 900 req/s
+on 1 vCPU. The remaining 20× speedup must come from doing **fewer
+comparisons**, not faster ones.
+
+That's `v5`'s job (coarse k-means partitioning).
+
+---
 ---
 
 ## Português
 
 > **Estratégia de branches:** cada passo grande vive numa branch própria
-> (`v1`, `v2`, `v3`, ...). A submissão final vive em `main`. Esta branch é
-> a **`v2`** — o stack com restrições reais: Docker Compose, nginx LB, duas
-> réplicas da API, dentro do orçamento de CPU/memória da rinha.
+> (`v1`, `v2`, `v3`, ...). A submissão final vive em `main`. Esta branch
+> é a **`v4`** — quantização int8 do dataset (168 MB → 42 MB) para
+> finalmente caber no orçamento de 350 MB da rinha.
 
-Na `v2` empacotamos o código da v1 num stack com forma de submissão real e
-rodamos o teste oficial do k6 dentro do ambiente real da rinha (1 vCPU +
-350 MB no total). **Sem mudanças algorítmicas**: o objectivo é aprender
-como são as restrições de verdade.
+Na `v4` substituímos o `float[3M*14]` heap-resident (168 MB) das v1–v3 por
+um `byte[3M*14]` quantizado em int8 (42 MB). O dataset agora cabe **com
+folga** dentro do orçamento de 350 MB da rinha (2 instâncias × 160 MB +
+nginx 30 MB = 350 MB exactos). O cálculo da distância usa um caminho
+híbrido: storage em byte com widening B→F SIMD on-the-fly, mantendo a
+aritmética float com FMA do v3 mas lendo 4× menos memória.
 
-**Spoiler:** o dataset em heap da v1 não cabe em duas instâncias dentro de
-350 MB. Mesmo afrouxando a memória, batemos no muro de 1 vCPU: cada request
-demora ~50–200 ms, o teste sobe para 900 req/s, o corte de p99 dispara.
-Score: **−6000**. Essa é a lição — e é o que `v3` em diante vai resolver
-com números reais.
+**Resultados:**
+- ✅ **Orçamento de memória resolvido.** Primeira versão que cabe nas
+  regras da rinha.
+- ✅ **Detecção continua excelente.** Teste de paridade: 95% de
+  concordância no fraud_score contra ground truth float32 em dados
+  uniformes sintéticos (pior caso). Run real Docker: só 2 erros em
+  668 servidos = 0.3% de misclass.
+- ❌ **Sem ganho de throughput nesta máquina.** Math em int puro (B→I,
+  mul) ficou mais lento que v3 vector porque VPMULLD tem throughput
+  pior que VFMADD em Haswell. O caminho híbrido B→F ficou igual a v3
+  vector em compute, e a vantagem de bandwidth não domina sob 1 vCPU
+  partilhada. Score continua −6000 em Docker.
+- 📌 **O verdadeiro gargalo mudou.** Com a memória sob controlo, o que
+  resta é o brute-force em si: 3M × 14 = 42M ops por request. A 1 ns/op
+  isso dá 42 ms — para lá do orçamento de 1 vCPU para 900 req/s.
+  Optimização algorítmica (k-means partitioning) é a próxima jogada
+  crítica.
 
-### Roadmap (revisto na v2)
+### Roadmap (atual)
 
-1. ✅ **`v1`** — baseline scalar, sem infra, JVM no host (final score: +2742)
-2. ✅ **`v2` (esta branch)** — Docker stack + nginx LB + cgroup limits (final score: −6000)
-3. **`v3`** — SIMD via `jdk.incubator.vector` (Vector API)
-4. **`v4`** — quantização int8 do dataset (168 MB → 42 MB)
-5. **`v5`** — GraalVM `native-image` (mata warmup + corta RSS)
-6. (opcional) **`v6`** — partição coarse com k-means (p99 sub-ms)
+1. ✅ **`v1`** — baseline scalar na JVM do host (final score: +2742)
+2. ✅ **`v2`** — Docker stack + nginx LB + cgroup limits (final score: −6000)
+3. ✅ **`v3`** — Vector API SIMD com KNN_MODE A/B (host: +2726, Docker: −6000)
+4. ✅ **`v4` (esta branch)** — int8 storage + híbrido B→F SIMD (Docker cabe em 350 MB, score: −6000)
+5. **`v5`** — partição coarse com k-means (alvo: comparar 5% dos vetores → p99 sub-10ms)
+6. **`v6`** — GraalVM `native-image` (mata warmup + corta RSS para a submissão final)
 
 ---
 
@@ -354,10 +428,10 @@ rinha-de-backend-andre-java/
 │   │   └── JsonReader.java              # parser manual
 │   ├── vector/
 │   │   ├── Vectorizer.java              # 14 dimensões + clamp
-│   │   ├── Dataset.java                 # mmap → float[]
+│   │   ├── Dataset.java                 # mmap → byte[] (int8) + scales
 │   │   └── KnnSearcher.java             # brute force + max-heap
 │   └── prep/
-│       └── DatasetBuilder.java          # CLI: references.json.gz → vectors.bin
+│       └── DatasetBuilder.java          # CLI: references.json.gz → vectors-i8.bin + scales.bin
 └── src/test/java/...
     ├── JsonReaderTest.java
     └── VectorizerTest.java
@@ -582,3 +656,50 @@ generoso.
   (≈25× de speedup).
 - Vector API sozinha dá 30–50%. Quantização int8 dá 4–8×. Partição coarse
   com k-means dá 10–20×. Vamos precisar de uma combinação.
+
+---
+
+### Resultados da v4 — quantização int8
+
+#### Host (sem limites)
+
+| Run | servidos | p99 | falha | final_score |
+|---|---|---|---|---|
+| v3 vector | 24 424 | 1241 ms | 0% | **+2726** |
+| v4 hybrid | 14 307 | 2002 ms | 56.86% | **−6000** |
+
+A v4 fica *mais lenta* no host: o widening SIMD B→F adiciona compute que
+não compensa numa máquina com bandwidth de memória abundante. v3 ganha
+aqui.
+
+#### Docker (1 vCPU dividida, 350 MB total — regras da rinha)
+
+| Run | servidos | p99 | falha | final_score |
+|---|---|---|---|---|
+| v2 raw      | 1 261 | 2001 ms | 97.38% | −6000 |
+| v3 scalar   | 1 605 | 2001 ms | 96.65% | −6000 |
+| v3 vector   | 1 188 | 2001 ms | 97.54% | −6000 |
+| v4 hybrid   | 668   | 2001 ms | 98.62% | −6000 |
+
+#### O que a v4 conseguiu de facto
+
+- ✅ **Orçamento de memória resolvido.** v1-v3 precisavam de 240 MB de
+  heap por instância; v4 cabe em 80 MB (dataset 42 MB + JVM ~30 MB). Duas
+  instâncias + nginx finalmente cabem **exatamente** nos 350 MB. O
+  docker-compose agora declara limites honestos (160 MB / api, 30 MB / nginx).
+- ✅ **Detecção continua excelente.** 1 FP e 1 FN em 668 servidos = 0.3%
+  de misclass em Docker. Teste de paridade confirma ≥95% de concordância
+  no fraud_score contra ground truth float32 em dados uniformes sintéticos.
+- ❌ **Sem ganho de throughput.** As quatro configurações batem o mesmo
+  piso de p99 sob 1 vCPU. O dataset int8 lê 4× menos memória mas o
+  compute é per-request bound, independentemente do tamanho dos dados.
+
+#### Para onde se mudou o gargalo
+
+Já não estamos memory-bound. Estamos agora bound pelo **brute force em
+si**: 3M vetores × 14 dims = 42M ops por request. A 1 ns/op isso dá 42 ms
+— e temos ~2 ms de orçamento por request para fazer 900 req/s em 1 vCPU.
+O speedup de 20× restante tem de vir de **menos comparações**, não de
+comparações mais rápidas.
+
+Esse é o trabalho da `v5` (partição coarse com k-means).

@@ -42,17 +42,20 @@ services:
       PORT: 9999
       DATA_DIR: /data
       THREADS: 2
-      # Heap explicitly sized below the cgroup limit. -XX:+UseSerialGC is
-      # cheaper than G1 on a single core and gives more predictable pauses.
-      # NOTE: 320m heap exceeds the rinha 175m-per-instance budget. v1 cannot
-      # fit because the dataset is heap-resident (168 MB float[]). v3/v4
-      # will solve this — for v2 we measure the 1-vCPU bottleneck.
-      JAVA_OPTS: "-Xmx320m -XX:+UseSerialGC --add-modules=jdk.incubator.vector"
+      # v4: int8 dataset is 42 MB (vs 168 MB float32 in v1-v3), so we can
+      # finally fit inside the rinha 350 MB-total budget.
+      # Heap breakdown per instance:
+      #   - dataset byte[]    : ~42 MB
+      #   - JVM overhead      : ~30 MB (metaspace + code cache + threads)
+      #   - working heap      : ~30 MB
+      #   total                ≈ 100-110 MB → -Xmx128m fits with margin
+      # Container limit 160 MB leaves some room for the kernel + GC bursts.
+      JAVA_OPTS: "-Xmx128m -XX:+UseSerialGC --add-modules=jdk.incubator.vector"
     deploy:
       resources:
         limits:
           cpus: "0.45"
-          memory: "380M"
+          memory: "160M"
 
   api-2:
     <<: *api

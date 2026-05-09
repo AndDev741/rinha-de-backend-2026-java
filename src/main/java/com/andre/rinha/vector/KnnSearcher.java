@@ -1,141 +1,166 @@
 package com.andre.rinha.vector;
 
+import jdk.incubator.vector.ByteVector;
+import jdk.incubator.vector.FloatVector;
+import jdk.incubator.vector.VectorMask;
+import jdk.incubator.vector.VectorOperators;
+import jdk.incubator.vector.VectorSpecies;
+
 /**
- * Brute-force k-NN search over the Dataset.
+ * v4 brute-force k-NN over the int8 quantized Dataset.
  *
- * Algorithm:
- *   1. For each reference vector, compute the squared L2 distance.
- *      (Squared because sqrt is expensive and doesn't change ordering.)
- *   2. Maintain a fixed-size K=5 binary max-heap with the best candidates.
- *      The top is the "worst of the top-5" — if a new candidate beats the
- *      top, replace it and restore the heap.
- *   3. At the end, count how many of the K neighbors are fraud.
+ * Pipeline per request:
+ *   1. Quantize the float query into byte[14] using Dataset.quantize.
+ *   2. Walk through all N reference vectors. For each:
+ *      - load 8 bytes via ByteVector
+ *      - sign-extend to FloatVector via B2F conversion (one VPMOVSXBD +
+ *        one VCVTDQ2PS in machine code)
+ *      - sub from preloaded float query, FMA accumulate sum + diff*diff
+ *      - reduceLanes for the squared distance
+ *   3. Maintain top-K via a size-5 max-heap with float distances.
+ *   4. Return fraud_score = (#fraud among top-K) / K.
  *
- * Why a max-heap instead of sorting everything:
- *   - Sorting 3M floats: O(n log n) = ~66M comparisons + allocation.
- *   - K-sized heap: O(n log K) = O(n × 2.3) ≈ 7M comparisons.
- *   - More importantly: zero extra allocation (heap lives in primitive arrays).
+ * Why byte storage but float compute (the "hybrid" approach):
  *
- * Observed performance (modern x86_64 CPU, no SIMD yet):
- *   - 3M vectors × 14 dims = 42M floats read (~168 MB) per request.
- *   - DRAM bandwidth ~20 GB/s → reading alone costs ~8 ms.
- *   - When float[] is in L3 cache (after the first request), drops to ~2 ms.
- *   - Compute (sub, mul, add) is partially auto-vectorized by the JIT —
- *     good enough for now.
+ *   We tried pure-int math (byte → int → sub → mul → add). Result on Docker
+ *   was -6000 with 711 served. The pure-float v3 path served 1188-1605.
+ *   Pure int8 SIMD was *slower* than v3 float32 SIMD because:
+ *     - VPMULLD (int multiply) has worse throughput than VFMADD231PS (FMA)
+ *     - One FMA replaces a separate mul + add
+ *     - Float pipeline has more execution ports on Haswell than int multiply
  *
- * That's the number to beat. Explicit Vector API will only help once we
- * exit the memory-bound regime — likely with int8 quantization.
+ *   Storing as bytes still gives us 4× memory bandwidth savings (8 bytes
+ *   read per chunk vs 32 bytes for float[]). Converting on the fly to
+ *   FloatVector lets us reuse the FMA-friendly v3 inner loop. We get the
+ *   memory win AND keep the fast compute path.
+ *
+ *   Distance ordering correctness: with global min/max, converting bytes
+ *   directly to floats (i.e., NOT dequantizing back to original units)
+ *   produces a distance that is a constant multiple of the float32 distance.
+ *   The k-NN top-5 set is identical up to rounding noise.
+ *
+ * SIMD widths (Mac Mini 2014 = Haswell = AVX2):
+ *   ByteVector .SPECIES_64  →  8 byte lanes  (64-bit register)
+ *   FloatVector.SPECIES_256 →  8 float lanes (256-bit register)
+ *   B→F conversion at part=0 maps lane-for-lane (sign extension + int→float).
  */
 public final class KnnSearcher {
 
     public static final int K = 5;
 
+    /** 8 byte lanes per chunk — matches FSPECIES lane count for 1:1 conversion. */
+    private static final VectorSpecies<Byte>  BSPECIES = ByteVector.SPECIES_64;
+    /** 8 float lanes per chunk — accumulator. */
+    private static final VectorSpecies<Float> FSPECIES = FloatVector.SPECIES_256;
+
+    /** Last byte index where a full SIMD chunk fits. With DIMS=14 and 8 lanes, this is 8. */
+    private static final int LOOP_BOUND = BSPECIES.loopBound(Dataset.DIMS);
+
+    /** Mask for the tail load. Lanes 0..(DIMS-LOOP_BOUND-1) are unmasked. */
+    private static final VectorMask<Byte> TAIL_MASK = BSPECIES.indexInRange(LOOP_BOUND, Dataset.DIMS);
+
     private final Dataset dataset;
 
-    // Reusable buffers per search to avoid hot-path allocation.
-    // WARNING: KnnSearcher is stateful per instance — create one per thread.
-    private final float[] heapDist = new float[K]; // distances of the K best
-    private final int[]   heapIdx  = new int[K];   // indices of the K best
+    // Reusable buffers — KnnSearcher is stateful per instance, one per thread.
+    private final byte[]  qBytes   = new byte[Dataset.DIMS];
+    private final float[] heapDist = new float[K];
+    private final int[]   heapIdx  = new int[K];
 
     public KnnSearcher(Dataset dataset) {
         this.dataset = dataset;
     }
 
-    /**
-     * Computes fraud_score = (#frauds among K nearest neighbors) / K.
-     *
-     * @param query query vector of size DIMS
-     * @return fraud_score between 0.0 and 1.0
-     */
-    public float fraudScore(float[] query) {
-        final float[] vecs = dataset.vectors();
-        final int count = dataset.count();
-        final int dims = Dataset.DIMS;
+    public static String simdInfo() {
+        return "B" + BSPECIES.length() + " → F" + FSPECIES.length()
+                + " (BSPECIES=" + BSPECIES + ", FSPECIES=" + FSPECIES
+                + ", LOOP_BOUND=" + LOOP_BOUND + ")";
+    }
 
-        // Initialize the heap with the first K vectors.
-        // Max-heap: position 0 is the worst (largest distance).
+    /** Computes fraud_score = (#frauds among K nearest neighbors) / K. */
+    public float fraudScore(float[] query) {
+        // 1. Quantize the query to int8 using the dataset's mins/maxs.
+        dataset.quantize(query, qBytes);
+
+        final byte[] vecs = dataset.vectors();
+        final int count = dataset.count();
+
+        // 2. Pre-load the query as FloatVectors. qFull is null when the SIMD
+        //    width is wider than DIMS (won't happen on AVX2 with DIMS=14).
+        final FloatVector qFull = LOOP_BOUND > 0
+                ? widenByteToFloat(ByteVector.fromArray(BSPECIES, qBytes, 0))
+                : null;
+        final FloatVector qTail = widenByteToFloat(
+                ByteVector.fromArray(BSPECIES, qBytes, LOOP_BOUND, TAIL_MASK));
+
+        // 3. Initialize the heap with the first K vectors.
         for (int i = 0; i < K; i++) {
-            heapDist[i] = squaredDistance(query, vecs, i * dims, dims);
+            heapDist[i] = squaredDistance(qFull, qTail, vecs, i * Dataset.DIMS);
             heapIdx[i] = i;
         }
-        // Heapify — reorganize the array to satisfy the max-heap property.
         for (int i = K / 2 - 1; i >= 0; i--) siftDown(i);
 
-        // Main loop over the remaining count - K vectors.
-        // This is the hot path.
+        // 4. Hot loop. No early-exit branch — kills SIMD speculation.
         for (int i = K; i < count; i++) {
-            int offset = i * dims;
-            // Classic optimization: if the partial distance has already
-            // exceeded the heap top, abort the calculation. With 14 dims the
-            // gain is small (few short-circuit chances), but it's free.
-            float topDist = heapDist[0];
-            float d = squaredDistanceWithBound(query, vecs, offset, dims, topDist);
-            if (d < topDist) {
+            float d = squaredDistance(qFull, qTail, vecs, i * Dataset.DIMS);
+            if (d < heapDist[0]) {
                 heapDist[0] = d;
                 heapIdx[0] = i;
                 siftDown(0);
             }
         }
 
-        // Count frauds among the final K.
-        int fraudCount = 0;
+        return countFrauds() / (float) K;
+    }
+
+    /**
+     * Squared L2 distance (in byte-as-float space).
+     *
+     * For DIMS=14 on AVX2:
+     *   chunk 0 — full width:   diff = qFull - widen(vecs[off..off+7])
+     *   tail    — masked load:  diff = qTail - widen(vecs[off+8..off+13])
+     *   FMA accumulate, reduce.
+     */
+    private static float squaredDistance(FloatVector qFull, FloatVector qTail,
+                                         byte[] vecs, int off) {
+        FloatVector sum = FloatVector.zero(FSPECIES);
+
+        if (qFull != null) {
+            for (int i = 0; i < LOOP_BOUND; i += BSPECIES.length()) {
+                FloatVector v = widenByteToFloat(ByteVector.fromArray(BSPECIES, vecs, off + i));
+                FloatVector diff = qFull.sub(v);
+                sum = diff.fma(diff, sum);  // sum + diff * diff in one rounding step
+            }
+        }
+
+        FloatVector vTail = widenByteToFloat(
+                ByteVector.fromArray(BSPECIES, vecs, off + LOOP_BOUND, TAIL_MASK));
+        FloatVector diffTail = qTail.sub(vTail);
+        sum = diffTail.fma(diffTail, sum);
+
+        return sum.reduceLanes(VectorOperators.ADD);
+    }
+
+    /**
+     * Sign-extending widen of an 8-lane ByteVector to an 8-lane FloatVector.
+     * VectorOperators.B2F first sign-extends each byte to an int, then
+     * converts that int to a float — both happen as a single conversion
+     * primitive on x86 (VPMOVSXBD + VCVTDQ2PS).
+     */
+    private static FloatVector widenByteToFloat(ByteVector b) {
+        return (FloatVector) b.convertShape(VectorOperators.B2F, FSPECIES, 0);
+    }
+
+    /* -------------------- Shared utilities -------------------- */
+
+    private int countFrauds() {
+        int n = 0;
         for (int i = 0; i < K; i++) {
-            if (dataset.isFraud(heapIdx[i])) fraudCount++;
+            if (dataset.isFraud(heapIdx[i])) n++;
         }
-        return fraudCount / (float) K;
+        return n;
     }
 
-    /* -------------------- Squared L2 distance -------------------- */
-
-    /**
-     * Simple version: reads 14 floats and computes sum((q[i] - v[i])^2).
-     * The JIT (C2) auto-vectorizes this loop well. Manual unrolling can
-     * help but isn't needed at this step.
-     */
-    private static float squaredDistance(float[] q, float[] vecs, int off, int dims) {
-        float sum = 0f;
-        for (int i = 0; i < dims; i++) {
-            float d = q[i] - vecs[off + i];
-            sum += d * d;
-        }
-        return sum;
-    }
-
-    /**
-     * Early-exit version: if sum has exceeded bound, returns immediately.
-     * Useful when we're far from the top-K and want to bail early.
-     *
-     * Note: early-exit breaks auto-vectorization because it introduces a
-     * branch in the middle of the loop. With 14 dims we can fit a single
-     * test halfway through.
-     */
-    private static float squaredDistanceWithBound(float[] q, float[] vecs, int off, int dims, float bound) {
-        // First half — no test, let the JIT vectorize.
-        float sum = 0f;
-        int half = dims >>> 1; // 7
-        for (int i = 0; i < half; i++) {
-            float d = q[i] - vecs[off + i];
-            sum += d * d;
-        }
-        // Test in the middle.
-        if (sum >= bound) return Float.POSITIVE_INFINITY;
-        // Second half.
-        for (int i = half; i < dims; i++) {
-            float d = q[i] - vecs[off + i];
-            sum += d * d;
-        }
-        return sum;
-    }
-
-    /* -------------------- Max-heap operations -------------------- */
-
-    /**
-     * Classic sift-down: pushes the element at position `i` downward until
-     * the max-heap property is restored.
-     *
-     * Max-heap: parent >= children. The top (pos 0) is the largest.
-     * When we replace the top with a smaller candidate, we just sink it.
-     */
+    /** Max-heap sift-down on float distances. */
     private void siftDown(int i) {
         final int n = K;
         while (true) {
@@ -145,7 +170,6 @@ public final class KnnSearcher {
             if (left  < n && heapDist[left]  > heapDist[largest]) largest = left;
             if (right < n && heapDist[right] > heapDist[largest]) largest = right;
             if (largest == i) return;
-            // Swap
             float td = heapDist[i]; heapDist[i] = heapDist[largest]; heapDist[largest] = td;
             int   ti = heapIdx[i];  heapIdx[i]  = heapIdx[largest];  heapIdx[largest]  = ti;
             i = largest;
