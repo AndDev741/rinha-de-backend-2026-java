@@ -33,7 +33,7 @@ to ~36k × — a roughly 80× reduction in inner-loop work.
 
 ### Roadmap (current)
 
-1. ✅ **`v1`** — scalar baseline on the host JVM (final score: +2742)
+1. ✅ **`v1`** — scalar baseline on the host JVM (host: +2742)
 2. ✅ **`v2`** — Docker stack + nginx LB + cgroup limits (final score: −6000)
 3. ✅ **`v3`** — Vector API SIMD with KNN_MODE A/B (host: +2726, Docker: −6000)
 4. ✅ **`v4`** — int8 storage + hybrid B→F SIMD (Docker fits 350 MB, score: −6000)
@@ -474,7 +474,7 @@ inner loop.
 
 ### Roadmap (atual)
 
-1. ✅ **`v1`** — baseline scalar na JVM do host (final score: +2742)
+1. ✅ **`v1`** — baseline scalar na JVM do host (host score: +2742)
 2. ✅ **`v2`** — Docker stack + nginx LB + cgroup limits (final score: −6000)
 3. ✅ **`v3`** — Vector API SIMD com KNN_MODE A/B (host: +2726, Docker: −6000)
 4. ✅ **`v4`** — int8 storage + híbrido B→F SIMD (Docker cabe em 350 MB, score: −6000)
