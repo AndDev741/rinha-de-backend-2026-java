@@ -1,8 +1,13 @@
 # ─────────────────────────────────────────────────────────────
-# rinha-fraud — local stack (v7: int16 IVF + bbox repair, JVM)
+# rinha-fraud — submission stack
 #
-# Layout:
-#   client → nginx (lb) → round-robin → api-1 + api-2
+# This compose file is what the rinha test engine runs. It does
+# not build anything: it pulls the pre-baked image from Docker
+# Hub. The image already contains the int16 IVF dataset under
+# /data, so /ready returns 200 within ~1 second after startup.
+#
+# Full source code, Dockerfile, and journey notes live on the
+# `main` branch.
 #
 # Resource budget (rinha rules: 1 CPU + 350 MB total):
 #   nginx  : 0.10 CPU /  20 MB
@@ -10,31 +15,17 @@
 #   api-2  : 0.45 CPU / 165 MB
 #   ─────────────────────────────
 #   TOTAL  : 1.00 CPU / 350 MB
-#
-# Memory profile per api-* container (JVM):
-#   - dataset short[]      : ~84 MB  (int16 IVF, vs v5/v6 42 MB int8)
-#   - centroids + bbox     : ~21 KB  (cache-friendly, sits in L1)
-#   - JVM overhead         : ~50 MB  (metaspace, code cache, threads)
-#   - working heap         : ~20 MB
-#   total                  ≈ 155 MB → -Xmx128m heap + ~30 MB non-heap fits 165 MB
 # ─────────────────────────────────────────────────────────────
 
 services:
   api-1: &api
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: rinha-fraud:v7
+    image: anddev741/rinha-fraud-java:v7
     networks:
       - rinha-net
-    # No volume mount: the int16 IVF dataset is baked into the image
-    # during `docker build` (see Dockerfile stage 1).
     environment:
       PORT: 9999
       DATA_DIR: /data
       THREADS: 2
-      # v7: int16 dataset is 84 MB heap. -Xmx128m gives ~44 MB of working
-      # heap headroom beyond the data, comfortably absorbing GC churn.
       JAVA_OPTS: "-Xmx128m -XX:+UseSerialGC"
     deploy:
       resources:
