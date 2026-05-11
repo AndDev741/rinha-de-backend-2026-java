@@ -3,20 +3,37 @@
 > **🇬🇧 [English](#english) · 🇧🇷 [Português](#português)**
 
 > **Branch strategy:** each major step lives on its own branch (`v1`, `v2`,
-> `v3`, ...). The final submission lives on `main`. This branch is **`v5`** —
-> IVF (Inverted File) coarse k-means partitioning. **First positive
-> Docker score: +2600.82.**
+> `v3`, ...). The final submission lives on `main`. This branch is **`v7`** —
+> int16 storage + bbox-repair IVF + scalar manual loop. **Docker score:
+> +4084.34** (p99 82 ms, 0% failure, exact k-NN).
 
 ---
 
 ## English
 
-In `v5` we replace brute force with **IVF (Inverted File Index)**: a coarse
-k-means partition over the 3M reference vectors into K=256 clusters. At
-query time we (1) compute distance to all K centroids, (2) pick the
-NPROBE=3 nearest clusters, and (3) brute-force the v4 hybrid SIMD distance
-only inside those clusters. The brute-force loop drops from 3M ×
-to ~36k × — a roughly 80× reduction in inner-loop work.
+In `v7` we **rebuild on top of v5** with three targeted changes inspired
+by the top JVM solution on the rinha leaderboard:
+
+1. **`int16` storage (× 10000 scaling)** instead of `int8`. Doubles the
+   memory footprint (84 MB vs 42 MB) but eliminates quantization loss —
+   distances in int16 space are an exact constant scaling of the float32
+   distances.
+2. **`bbox-repair` IVF** instead of `nprobe=3` approximation. At build time
+   we compute the axis-aligned bounding box of each cluster. At query time
+   we scan the **single** closest cluster, then for every other cluster
+   compute a strict lower-bound distance to its bbox. Clusters that can
+   provably not beat the current top-5 are skipped. This is **exact** k-NN
+   with most clusters never scanned.
+3. **Pure scalar manual-unrolled loop** instead of Vector API. v6 showed
+   that GraalVM's experimental Vector API support hurts us, and even on
+   the JIT a scalar loop with `if (dist > worst) continue` between dims
+   exits cheaply for far candidates. The JIT auto-vectorizes the simple
+   form when it can.
+
+**Result: +4084 in Docker (up +1484 from v5).** Detection score hits the
++3000 ceiling (FP=0, FN=0). The remaining gap to the leaderboard top is
+all in p99 (currently 82 ms, room for ~+2000 more if we can hit single-
+digit milliseconds).
 
 **Findings:**
 - 🎯 **First positive Docker score: +2600.82** (was −6000 in v4).
@@ -37,9 +54,25 @@ to ~36k × — a roughly 80× reduction in inner-loop work.
 2. ✅ **`v2`** — Docker stack + nginx LB + cgroup limits (final score: −6000)
 3. ✅ **`v3`** — Vector API SIMD with KNN_MODE A/B (host: +2726, Docker: −6000)
 4. ✅ **`v4`** — int8 storage + hybrid B→F SIMD (Docker fits 350 MB, score: −6000)
-5. ✅ **`v5` (this branch)** — IVF coarse k-means (Docker: **+2600.82**, p99 88 ms)
-6. **`v6`** — GraalVM `native-image` (target: kill warmup, ~30-50 % p99 cut, push score above +3000)
-7. (optional) **`v7`** — NPROBE tuning, residual quantization, or smaller-K experiments
+5. ✅ **`v5`** — IVF coarse k-means, NPROBE=3 approximation (Docker: +2600.82, p99 88 ms)
+6. ✅ **`v6`** — GraalVM `native-image` attempt (Docker: −6000, regression vs v5)
+7. ✅ **`v7` (this branch)** — int16 + bbox-repair + scalar manual loop (Docker: **+4084.34**, p99 82 ms, exact k-NN)
+
+### Future optimizations — not yet attempted
+
+- **HAProxy + Unix Domain Socket** instead of nginx + TCP — cheaper hop
+  for localhost traffic, can shave ~50-100 ms off p99 outliers under load.
+- **K=1024 + cluster splitting** (cap max cluster size at ~500) — tighter
+  clusters mean faster per-bucket scans and more aggressive bbox pruning.
+- **GraalVM native-image revisited.** v7's pure scalar code (no Vector API)
+  is exactly what native-image handles best. Worth re-trying — might
+  finally deliver the warmup-free + low-RSS win v6 couldn't.
+- **Pre-baked HTTP responses** — pre-build the 6 possible response bytes
+  (one per fraud_score value of 0.0/0.2/0.4/0.6/0.8/1.0) and just
+  `write()` the right one. Skips StringBuilder + UTF-8 encode per request.
+- **PGO (Profile-Guided Optimization)** for native-image. Collect a
+  runtime profile, rebuild — could push native-image past the JIT.
+- **Bake the dataset into the image** — needed for actual rinha submission.
 
 Each branch is self-contained and lets us compare scores side-by-side as we
 evolve the solution.
@@ -64,16 +97,15 @@ rinha-de-backend-andre-java/
 │   │   └── JsonReader.java              # hand-rolled parser
 │   ├── vector/
 │   │   ├── Vectorizer.java              # 14 dimensions + clamp
-│   │   ├── Dataset.java                 # mmap → byte[] (int8) + scales + centroids + offsets
-│   │   ├── KnnSearcher.java             # IVF: centroid search + bucket scan
+│   │   ├── Dataset.java                 # mmap → short[] (int16 × 10000) + centroids + bbox + offsets
+│   │   ├── KnnSearcher.java             # IVF + bbox-repair (exact k-NN, scalar)
 │   │   └── KMeans.java                  # Lloyd's + k-means++ (build-time only)
 │   └── prep/
-│       └── DatasetBuilder.java          # CLI: json.gz → int8 + scales + centroids + offsets
+│       └── DatasetBuilder.java          # CLI: json.gz → int16 + centroids + bbox + offsets
 └── src/test/java/...
     ├── JsonReaderTest.java
     ├── VectorizerTest.java
-    ├── KnnSearcherInt8ParityTest.java   # v4: int8 vs float32 ground truth
-    └── KnnSearcherIvfRecallTest.java    # v5: IVF recall vs brute-force
+    └── KnnSearcherIvfRecallTest.java    # v7: int16 + IVF + bbox vs float32 (exact)
 ```
 
 ---
@@ -442,22 +474,98 @@ Detailed v5 Docker breakdown:
 - **Combined v5+v6 target: +4500–5000.**
 
 ---
+
+### v7 results — int16 + bbox repair + scalar manual loop
+
+#### Build artifacts
+
+| | v5 (int8 IVF) | v7 (int16 + bbox) |
+|---|---|---|
+| `vectors-i16.bin` | 42 MB (int8) | **84 MB** (int16) |
+| `centroids` | 14 KB (float32) | 7 KB (int16) |
+| `bbox.bin` | — | **14 KB** (new) |
+| Heap per instance | ~80 MB | ~110 MB |
+| Build time (k-means + reorder + bbox) | ~110 s | ~150 s |
+
+#### Benchmarks
+
+| Run | served | p99 | failure | FP / FN | final_score |
+|---|---|---|---|---|---|
+| v5 host    | 54 059 | 2.26 ms | 0.26 %  | 72 / 70 | +4193.11 |
+| **v7 host** | **54 059** | **1.92 ms** | **0 %** | **0 / 0** | **+5715.76** |
+| v5 Docker  | 53 891 | 88 ms   | 0.26 %  | 72 / 70 | +2600.82 |
+| **v7 Docker** | **54 038** | **82 ms** | **0 %** | **0 / 0** | **+4084.34** |
+
+#### Why the +1484 jump
+
+| Score component | v5 Docker | v7 Docker | Δ |
+|---|---|---|---|
+| p99_score | +1054 | +1084 | +30 |
+| detection_score | +1547 | **+3000** | **+1453** |
+| **final_score** | **+2600** | **+4084** | **+1484** |
+
+The win is essentially all in detection. v5's NPROBE=3 approximation cost
+~1300 points (FP=72, FN=70 out of 54k served). v7's bbox-repair recovers
+all of it — **exact k-NN, FP=0, FN=0**.
+
+The bbox lower-bound check is O(14) per cluster — cheaper than scanning
+even one vector — and rejects ~85% of clusters in this dataset. The
+fraction of clusters actually scanned per query is small, so p99 doesn't
+suffer despite running exact search.
+
+#### Why v7 dropped the Vector API
+
+v6 demonstrated that GraalVM's native-image Vector API support is
+incomplete and produces a runtime regression. We also re-examined the JIT
+case: on 14-dim vectors, the scalar manual loop with `if (dist > worst)
+continue` between dims actually hits comparable throughput to FMA-SIMD
+because (a) far candidates exit after 2-4 dims and (b) the JIT auto-
+vectorizes the leading sub+mul+add chain just fine.
+
+Bonus: dropping Vector API removes `--add-modules=jdk.incubator.vector`
+from the build flags. The project no longer depends on incubator modules.
+
+#### What's left
+
+- **p99 has +1916 of headroom** (current +1084, max +3000). The leaderboard
+  top sits at p99 = 3.7 ms with the same algorithm — closing this gap
+  means UDS instead of TCP, smaller buckets (K=1024), pre-baked HTTP
+  responses, possibly native-image now that Vector API is gone.
+- **Detection is maxed out** at +3000.
+- **Combined target with future optimizations: ~+5500-6000.**
+
+---
 ---
 
 ## Português
 
 > **Estratégia de branches:** cada passo grande vive numa branch própria
 > (`v1`, `v2`, `v3`, ...). A submissão final vive em `main`. Esta branch
-> é a **`v5`** — IVF (Inverted File) com partição coarse via k-means.
-> **Primeiro score positivo em Docker: +2600.82.**
+> é a **`v7`** — int16 + IVF com bbox-repair + loop scalar manual.
+> **Score Docker: +4084.34** (p99 82 ms, 0% falha, k-NN exato).
 
-Na `v5` substituímos o brute force pelo **IVF (Inverted File Index)**:
-uma partição coarse via k-means dos 3M vetores de referência em K=256
-clusters. Em query time (1) calculamos distância da query aos K centróides,
-(2) escolhemos os NPROBE=3 clusters mais próximos, e (3) fazemos brute
-force SIMD híbrido (do v4) só dentro desses clusters. O loop de brute
-force cai de 3M × para ~36k × — uma redução de ~80× no trabalho do
-inner loop.
+Na `v7` **reconstruímos sobre a v5** com três mudanças cirúrgicas
+inspiradas na melhor solução JVM do ranking da rinha:
+
+1. **Storage int16 (× 10000)** em vez de int8. Dobra a memória (84 MB vs
+   42 MB) mas **elimina perda de quantização** — as distâncias em int16
+   são uma escala exata constante das distâncias float32.
+2. **IVF com bbox-repair** em vez de NPROBE=3 aproximado. No build-time
+   calculamos a bounding box axis-aligned de cada cluster. Em query
+   varremos o cluster mais próximo, depois para cada outro cluster
+   calculamos a distância mínima possível à sua bbox. Clusters que
+   provavelmente não batem o top-5 atual são saltados. Isto é k-NN
+   **exato** com a maioria dos clusters nunca varridos.
+3. **Loop scalar manual unrolled** em vez de Vector API. A v6 mostrou
+   que o suporte experimental da Vector API no GraalVM nos prejudica, e
+   mesmo no JIT um loop scalar com `if (dist > worst) continue` entre
+   dims sai cedo para candidatos longe. O JIT auto-vetoriza a forma
+   simples quando consegue.
+
+**Resultado: +4084 em Docker (subida de +1484 desde v5).** Detection score
+chega ao tecto de +3000 (FP=0, FN=0). O gap que falta para o topo do
+ranking é todo no p99 (82 ms agora; ~+2000 pontos disponíveis se
+chegarmos a single-digit ms).
 
 **Resultados:**
 - 🎯 **Primeiro score positivo em Docker: +2600.82** (era −6000 em v4).
@@ -478,9 +586,27 @@ inner loop.
 2. ✅ **`v2`** — Docker stack + nginx LB + cgroup limits (final score: −6000)
 3. ✅ **`v3`** — Vector API SIMD com KNN_MODE A/B (host: +2726, Docker: −6000)
 4. ✅ **`v4`** — int8 storage + híbrido B→F SIMD (Docker cabe em 350 MB, score: −6000)
-5. ✅ **`v5` (esta branch)** — IVF coarse k-means (Docker: **+2600.82**, p99 88 ms)
-6. **`v6`** — GraalVM `native-image` (alvo: matar warmup, cortar p99 30-50%, score acima de +3000)
-7. (opcional) **`v7`** — tuning de NPROBE, residual quantization ou experiências com K menor
+5. ✅ **`v5`** — IVF coarse k-means, NPROBE=3 aproximado (Docker: +2600.82, p99 88 ms)
+6. ✅ **`v6`** — tentativa GraalVM `native-image` (Docker: −6000, regressão vs v5)
+7. ✅ **`v7` (esta branch)** — int16 + bbox-repair + loop scalar (Docker: **+4084.34**, p99 82 ms, k-NN exato)
+
+### Optimizações futuras — ainda não experimentadas
+
+- **HAProxy + Unix Domain Socket** em vez de nginx + TCP — hop mais barato
+  para tráfego localhost, pode tirar ~50-100 ms de p99 outliers.
+- **K=1024 + split de clusters** (cap max ~500 vetores/cluster) — clusters
+  mais apertados → scans por bucket mais rápidos + pruning bbox mais
+  agressivo.
+- **GraalVM native-image revisitado.** O código scalar puro da v7 (sem
+  Vector API) é exatamente o que o native-image melhor consegue. Vale
+  re-tentar — pode finalmente entregar o ganho de warmup zero + RSS baixo
+  que a v6 não conseguiu.
+- **Respostas HTTP pré-prontas** — pré-construir os 6 bytes possíveis
+  (um por fraud_score 0.0/0.2/0.4/0.6/0.8/1.0) e só fazer `write()` do
+  certo. Salta o StringBuilder + encode UTF-8 por request.
+- **PGO (Profile-Guided Optimization)** para native-image. Correr sob
+  carga, coletar profile, recompilar — pode levar o native-image além do JIT.
+- **Bake do dataset na imagem** — necessário para a submissão real da rinha.
 
 ---
 
@@ -502,16 +628,15 @@ rinha-de-backend-andre-java/
 │   │   └── JsonReader.java              # parser manual
 │   ├── vector/
 │   │   ├── Vectorizer.java              # 14 dimensões + clamp
-│   │   ├── Dataset.java                 # mmap → byte[] (int8) + scales + centroids + offsets
-│   │   ├── KnnSearcher.java             # IVF: centroid search + bucket scan
+│   │   ├── Dataset.java                 # mmap → short[] (int16 × 10000) + centroids + bbox + offsets
+│   │   ├── KnnSearcher.java             # IVF + bbox-repair (exact k-NN, scalar)
 │   │   └── KMeans.java                  # Lloyd's + k-means++ (build-time only)
 │   └── prep/
-│       └── DatasetBuilder.java          # CLI: json.gz → int8 + scales + centroids + offsets
+│       └── DatasetBuilder.java          # CLI: json.gz → int16 + centroids + bbox + offsets
 └── src/test/java/...
     ├── JsonReaderTest.java
     ├── VectorizerTest.java
-    ├── KnnSearcherInt8ParityTest.java   # v4: int8 vs float32 ground truth
-    └── KnnSearcherIvfRecallTest.java    # v5: IVF recall vs brute-force
+    └── KnnSearcherIvfRecallTest.java    # v7: int16 + IVF + bbox vs float32 (exact)
 ```
 
 ---
@@ -858,3 +983,65 @@ Breakdown detalhado da v5 Docker:
   (GraalVM nativo) deve matar variância do JIT warmup e apertar
   layout.
 - **Alvo combinado v5+v6: +4500–5000.**
+
+---
+
+### Resultados da v7 — int16 + bbox repair + loop scalar manual
+
+#### Artefactos do build
+
+| | v5 (int8 IVF) | v7 (int16 + bbox) |
+|---|---|---|
+| `vectors-i16.bin` | 42 MB (int8) | **84 MB** (int16) |
+| `centroids` | 14 KB (float32) | 7 KB (int16) |
+| `bbox.bin` | — | **14 KB** (novo) |
+| Heap por instância | ~80 MB | ~110 MB |
+| Build time (k-means + reorder + bbox) | ~110 s | ~150 s |
+
+#### Benchmarks
+
+| Run | servidos | p99 | falha | FP / FN | final_score |
+|---|---|---|---|---|---|
+| v5 host    | 54 059 | 2.26 ms | 0.26 %  | 72 / 70 | +4193.11 |
+| **v7 host** | **54 059** | **1.92 ms** | **0 %** | **0 / 0** | **+5715.76** |
+| v5 Docker  | 53 891 | 88 ms   | 0.26 %  | 72 / 70 | +2600.82 |
+| **v7 Docker** | **54 038** | **82 ms** | **0 %** | **0 / 0** | **+4084.34** |
+
+#### Por que o salto de +1484
+
+| Componente | v5 Docker | v7 Docker | Δ |
+|---|---|---|---|
+| p99_score | +1054 | +1084 | +30 |
+| detection_score | +1547 | **+3000** | **+1453** |
+| **final_score** | **+2600** | **+4084** | **+1484** |
+
+A vitória é essencialmente toda em detection. A aproximação NPROBE=3 da
+v5 custou ~1300 pontos (FP=72, FN=70 em 54k servidos). O bbox-repair da
+v7 recupera tudo — **k-NN exato, FP=0, FN=0**.
+
+A verificação de bbox lower-bound é O(14) por cluster — mais barato que
+varrer um único vetor — e rejeita ~85% dos clusters neste dataset. A
+fração de clusters de facto varridos por query é pequena, então o p99
+não sofre apesar de fazermos busca exata.
+
+#### Por que a v7 abandonou a Vector API
+
+A v6 demonstrou que o suporte da Vector API no native-image é incompleto
+e produz regressão em runtime. Re-examinámos também o caso JIT: em
+vetores de 14 dims, o loop scalar manual com `if (dist > worst)
+continue` entre dims atinge throughput comparável ao FMA-SIMD porque
+(a) candidatos longe saem após 2-4 dims e (b) o JIT auto-vetoriza a
+sequência sub+mul+add inicial sem problemas.
+
+Bónus: dropar Vector API remove `--add-modules=jdk.incubator.vector` das
+flags de build. O projeto já não depende de módulos incubator.
+
+#### O que sobra
+
+- **p99 tem +1916 de margem** (atual +1084, máximo +3000). O topo do
+  ranking está em p99 = 3.7 ms com o mesmo algoritmo — fechar o gap
+  significa UDS em vez de TCP, buckets mais pequenos (K=1024), respostas
+  HTTP pré-prontas, possivelmente native-image agora que Vector API
+  saiu.
+- **Detection está no máximo** em +3000.
+- **Alvo combinado com optimizações futuras: ~+5500-6000.**

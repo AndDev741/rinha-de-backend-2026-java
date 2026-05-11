@@ -11,89 +11,82 @@ import java.nio.file.StandardOpenOption;
 import java.util.BitSet;
 
 /**
- * v5 dataset — int8 quantized + IVF (Inverted File Index) layout.
+ * v7 dataset — int16 quantized + IVF + per-cluster bounding boxes.
  *
  * Reads five files produced by {@link com.andre.rinha.prep.DatasetBuilder}:
- *   vectors-i8.bin       →  N × 14 signed bytes (quantized vectors,
- *                            REORDERED so cluster 0 comes first, then 1, ...)
- *   scales.bin           →  mins[14] + maxs[14] as float32 LE
- *   labels.bin           →  packed bitset, bit i = 1 if vector i is fraud
- *                            (also reordered to match the new vector order)
- *   centroids.bin        →  K × 14 float32 LE — each cluster's centroid
- *   cluster_offsets.bin  →  K+1 int32 LE — start of each cluster in the
- *                            reordered vectors array (offsets[K] = total N)
+ *   vectors-i16.bin       →  N × 14 int16 LE (× 10000 scaling), reordered by cluster
+ *   centroids-i16.bin     →  K × 14 int16 LE (same scaling)
+ *   bbox.bin              →  K × 14 + K × 14 int16 LE (mins then maxs per cluster)
+ *   cluster_offsets.bin   →  K+1 int32 LE
+ *   labels.bin            →  packed bitset
  *
  * Memory profile:
- *   vectors[]    ≈ 42 MB   (int8 storage)
- *   labels       ≈ 375 KB
- *   centroids    ≈ 14 KB   (256 × 14 × 4 — fits comfortably in L1 cache)
- *   offsets      ≈ 1 KB
- *   mins/maxs    = 112 B
+ *   vectors[]      ≈  84 MB  (2 × 14 × 3M)
+ *   centroids      ≈   7 KB
+ *   bbox_min/max   ≈  14 KB  (fits in L1 cache → bbox repair is near-free)
+ *   labels         ≈ 375 KB
  *
- * Quantization invariant (unchanged from v4):
- *   For each dim d the byte b corresponds to the float
- *     f = ((b + 128) / 255) * (maxs[d] - mins[d]) + mins[d]
- *   Both the dataset and any query are quantized with the SAME mins/maxs,
- *   so squared int8 differences are a constant scaling of float32 distance.
+ * Quantization (lossless for our purposes):
+ *   short(v) = round(v × 10000)
+ *   For float values in [-1, 1], maps to int16 [-10000, 10000], safely
+ *   inside short's range. ~0.0001 quantization step preserves ~4 decimal
+ *   digits — effectively float-equivalent precision.
+ *
+ * Squared int16 distance is exactly the float32 squared distance × 1e8,
+ * so ordering is preserved with no per-dim weighting tricks.
  */
 public final class Dataset {
 
     public static final int DIMS = Vectorizer.DIMS;
 
-    private static final int TAIL_PAD = 16;
+    /** Quantization scale: float × SCALE → int16 (must match DatasetBuilder). */
+    public static final int SCALE = 10_000;
 
-    private final byte[] vectors;
-    private final BitSet labels;
-    private final int count;
-    private final float[] mins;
-    private final float[] maxs;
-    private final float[] scaleFactor;
+    /** Tail padding bytes (in shorts) — kept for layout symmetry. */
+    private static final int TAIL_PAD = 8;
 
-    /** v5: cluster centroids, flat layout [K * DIMS] in float32. */
-    private final float[] centroids;
-    /** v5: number of clusters K. */
-    private final int k;
-    /**
-     * v5: cluster offsets, length K+1.
-     * Cluster c spans vector indices [offsets[c], offsets[c+1]).
-     */
-    private final int[] clusterOffsets;
+    private final short[] vectors;     // length = count * DIMS + TAIL_PAD
+    private final BitSet  labels;
+    private final int     count;
+    private final short[] centroids;   // length = k * DIMS
+    private final int     k;
+    private final int[]   clusterOffsets;
+    private final short[] bboxMin;     // length = k * DIMS
+    private final short[] bboxMax;     // length = k * DIMS
 
-    private Dataset(byte[] vectors, BitSet labels, int count,
-                    float[] mins, float[] maxs, float[] scaleFactor,
-                    float[] centroids, int k, int[] clusterOffsets) {
+    private Dataset(short[] vectors, BitSet labels, int count,
+                    short[] centroids, int k, int[] clusterOffsets,
+                    short[] bboxMin, short[] bboxMax) {
         this.vectors = vectors;
         this.labels = labels;
         this.count = count;
-        this.mins = mins;
-        this.maxs = maxs;
-        this.scaleFactor = scaleFactor;
         this.centroids = centroids;
         this.k = k;
         this.clusterOffsets = clusterOffsets;
+        this.bboxMin = bboxMin;
+        this.bboxMax = bboxMax;
     }
 
-    public int count() { return count; }
-    public byte[] vectors() { return vectors; }
-    public boolean isFraud(int i) { return labels.get(i); }
-    public float[] mins() { return mins; }
-    public float[] maxs() { return maxs; }
+    public int       count()                  { return count; }
+    public short[]   vectors()                { return vectors; }
+    public boolean   isFraud(int i)           { return labels.get(i); }
+    public int       k()                      { return k; }
+    public short[]   centroids()              { return centroids; }
+    public int       clusterStart(int c)      { return clusterOffsets[c]; }
+    public int       clusterEnd(int c)        { return clusterOffsets[c + 1]; }
+    public short[]   bboxMin()                { return bboxMin; }
+    public short[]   bboxMax()                { return bboxMax; }
 
-    public int k() { return k; }
-    public float[] centroids() { return centroids; }
-
-    /** Inclusive start index (in vector units) of cluster {@code c}. */
-    public int clusterStart(int c) { return clusterOffsets[c]; }
-    /** Exclusive end index (in vector units) of cluster {@code c}. */
-    public int clusterEnd(int c)   { return clusterOffsets[c + 1]; }
-
-    /** Quantize a float[14] query into a byte[14] using the dataset's scales. */
-    public void quantize(float[] in, byte[] out) {
+    /**
+     * Quantize a float[14] query into a short[14] using the global × 10000
+     * scaling. No per-dim min/max needed.
+     */
+    public static void quantize(float[] in, short[] out) {
         for (int d = 0; d < DIMS; d++) {
-            int q = Math.round((in[d] - mins[d]) * scaleFactor[d]) - 128;
-            if (q < -128) q = -128;
-            if (q >  127) q =  127;
-            out[d] = (byte) q;
+            int q = Math.round(in[d] * SCALE);
+            if (q < Short.MIN_VALUE) q = Short.MIN_VALUE;
+            if (q > Short.MAX_VALUE) q = Short.MAX_VALUE;
+            out[d] = (short) q;
         }
     }
 
@@ -101,66 +94,90 @@ public final class Dataset {
      * Build a Dataset directly from in-memory arrays. Used by tests so they
      * don't have to roundtrip through DatasetBuilder.
      */
-    public static Dataset fromArrays(byte[] vectors, BitSet labels,
-                                     float[] mins, float[] maxs,
-                                     float[] centroids, int[] clusterOffsets) {
+    public static Dataset fromArrays(short[] vectors, BitSet labels,
+                                     short[] centroids, int[] clusterOffsets,
+                                     short[] bboxMin, short[] bboxMax) {
         if (vectors.length % DIMS != 0) {
             throw new IllegalArgumentException("vectors.length must be a multiple of " + DIMS);
         }
-        if (mins.length != DIMS || maxs.length != DIMS) {
-            throw new IllegalArgumentException("mins/maxs must each have length " + DIMS);
-        }
+        int count = vectors.length / DIMS;
         if (centroids.length % DIMS != 0) {
             throw new IllegalArgumentException("centroids.length must be a multiple of " + DIMS);
         }
         int kClusters = centroids.length / DIMS;
         if (clusterOffsets.length != kClusters + 1) {
-            throw new IllegalArgumentException(
-                    "clusterOffsets.length must be K+1 = " + (kClusters + 1));
+            throw new IllegalArgumentException("clusterOffsets.length must be K+1");
         }
-        int count = vectors.length / DIMS;
         if (clusterOffsets[kClusters] != count) {
-            throw new IllegalArgumentException(
-                    "clusterOffsets[K] must equal count: " + clusterOffsets[kClusters] + " != " + count);
+            throw new IllegalArgumentException("clusterOffsets[K] must equal count");
         }
-        byte[] padded = new byte[vectors.length + TAIL_PAD];
+        if (bboxMin.length != kClusters * DIMS || bboxMax.length != kClusters * DIMS) {
+            throw new IllegalArgumentException("bbox arrays must each have length K*DIMS");
+        }
+        short[] padded = new short[vectors.length + TAIL_PAD];
         System.arraycopy(vectors, 0, padded, 0, vectors.length);
-        return new Dataset(padded, labels, count, mins, maxs, computeScale(mins, maxs),
-                centroids, kClusters, clusterOffsets);
+        return new Dataset(padded, labels, count, centroids, kClusters, clusterOffsets,
+                bboxMin, bboxMax);
     }
 
-    /** Loads all five v5 files from a directory. */
+    /** Loads all five v7 files from a directory. */
     public static Dataset load(Path dir) throws IOException {
-        Path vectorsPath   = dir.resolve("vectors-i8.bin");
-        Path scalesPath    = dir.resolve("scales.bin");
-        Path labelsPath    = dir.resolve("labels.bin");
-        Path centroidsPath = dir.resolve("centroids.bin");
+        Path vectorsPath   = dir.resolve("vectors-i16.bin");
+        Path centroidsPath = dir.resolve("centroids-i16.bin");
+        Path bboxPath      = dir.resolve("bbox.bin");
         Path offsetsPath   = dir.resolve("cluster_offsets.bin");
+        Path labelsPath    = dir.resolve("labels.bin");
 
         // ---- vectors ----
         long vectorsSize = Files.size(vectorsPath);
-        if (vectorsSize % DIMS != 0) {
-            throw new IOException("vectors-i8.bin size " + vectorsSize
-                    + " is not a multiple of " + DIMS);
+        if (vectorsSize % (DIMS * 2L) != 0) {
+            throw new IOException("vectors-i16.bin size " + vectorsSize
+                    + " is not a multiple of " + (DIMS * 2));
         }
-        int count = (int) (vectorsSize / DIMS);
-        byte[] vectors = new byte[(int) vectorsSize + TAIL_PAD];
+        int count = (int) (vectorsSize / (DIMS * 2L));
+        short[] vectors = new short[count * DIMS + TAIL_PAD];
         try (FileChannel ch = FileChannel.open(vectorsPath, StandardOpenOption.READ)) {
             MappedByteBuffer mbb = ch.map(FileChannel.MapMode.READ_ONLY, 0, vectorsSize);
-            mbb.get(vectors, 0, (int) vectorsSize);
+            mbb.order(ByteOrder.LITTLE_ENDIAN);
+            mbb.asShortBuffer().get(vectors, 0, count * DIMS);
         }
 
-        // ---- scales ----
-        byte[] scaleBytes = Files.readAllBytes(scalesPath);
-        if (scaleBytes.length != DIMS * 2 * 4) {
-            throw new IOException("scales.bin has unexpected size " + scaleBytes.length
-                    + ", expected " + (DIMS * 2 * 4));
+        // ---- centroids ----
+        byte[] centroidBytes = Files.readAllBytes(centroidsPath);
+        if (centroidBytes.length % (DIMS * 2) != 0) {
+            throw new IOException("centroids-i16.bin size " + centroidBytes.length
+                    + " is not a multiple of " + (DIMS * 2));
         }
-        ByteBuffer sb = ByteBuffer.wrap(scaleBytes).order(ByteOrder.LITTLE_ENDIAN);
-        float[] mins = new float[DIMS];
-        float[] maxs = new float[DIMS];
-        for (int d = 0; d < DIMS; d++) mins[d] = sb.getFloat();
-        for (int d = 0; d < DIMS; d++) maxs[d] = sb.getFloat();
+        int kClusters = centroidBytes.length / (DIMS * 2);
+        short[] centroids = new short[kClusters * DIMS];
+        ByteBuffer.wrap(centroidBytes).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer().get(centroids);
+
+        // ---- bbox ----
+        byte[] bboxBytes = Files.readAllBytes(bboxPath);
+        int expectedBbox = kClusters * DIMS * 2 * 2;  // K*DIMS * 2 (min,max) * 2 bytes
+        if (bboxBytes.length != expectedBbox) {
+            throw new IOException("bbox.bin size " + bboxBytes.length
+                    + ", expected " + expectedBbox);
+        }
+        short[] bboxAll = new short[kClusters * DIMS * 2];
+        ByteBuffer.wrap(bboxBytes).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer().get(bboxAll);
+        short[] bboxMin = new short[kClusters * DIMS];
+        short[] bboxMax = new short[kClusters * DIMS];
+        System.arraycopy(bboxAll, 0,                  bboxMin, 0, kClusters * DIMS);
+        System.arraycopy(bboxAll, kClusters * DIMS,   bboxMax, 0, kClusters * DIMS);
+
+        // ---- offsets ----
+        byte[] offsetBytes = Files.readAllBytes(offsetsPath);
+        if (offsetBytes.length != (kClusters + 1) * 4) {
+            throw new IOException("cluster_offsets.bin size " + offsetBytes.length
+                    + ", expected " + ((kClusters + 1) * 4));
+        }
+        int[] offsets = new int[kClusters + 1];
+        ByteBuffer.wrap(offsetBytes).order(ByteOrder.LITTLE_ENDIAN).asIntBuffer().get(offsets);
+        if (offsets[kClusters] != count) {
+            throw new IOException("cluster_offsets[K] = " + offsets[kClusters]
+                    + " does not match vector count " + count);
+        }
 
         // ---- labels ----
         byte[] labelBytes = Files.readAllBytes(labelsPath);
@@ -174,41 +191,7 @@ public final class Dataset {
             }
         }
 
-        // ---- centroids ----
-        byte[] centroidBytes = Files.readAllBytes(centroidsPath);
-        if (centroidBytes.length % (DIMS * 4) != 0) {
-            throw new IOException("centroids.bin size " + centroidBytes.length
-                    + " is not a multiple of " + (DIMS * 4));
-        }
-        int kClusters = centroidBytes.length / (DIMS * 4);
-        ByteBuffer cb = ByteBuffer.wrap(centroidBytes).order(ByteOrder.LITTLE_ENDIAN);
-        float[] centroids = new float[kClusters * DIMS];
-        for (int i = 0; i < centroids.length; i++) centroids[i] = cb.getFloat();
-
-        // ---- offsets ----
-        byte[] offsetBytes = Files.readAllBytes(offsetsPath);
-        if (offsetBytes.length != (kClusters + 1) * 4) {
-            throw new IOException("cluster_offsets.bin size " + offsetBytes.length
-                    + " expected " + ((kClusters + 1) * 4));
-        }
-        ByteBuffer ob = ByteBuffer.wrap(offsetBytes).order(ByteOrder.LITTLE_ENDIAN);
-        int[] offsets = new int[kClusters + 1];
-        for (int i = 0; i < offsets.length; i++) offsets[i] = ob.getInt();
-        if (offsets[kClusters] != count) {
-            throw new IOException("cluster_offsets[K] = " + offsets[kClusters]
-                    + " does not match vector count " + count);
-        }
-
-        return new Dataset(vectors, labels, count, mins, maxs, computeScale(mins, maxs),
-                centroids, kClusters, offsets);
-    }
-
-    private static float[] computeScale(float[] mins, float[] maxs) {
-        float[] scale = new float[DIMS];
-        for (int d = 0; d < DIMS; d++) {
-            float range = maxs[d] - mins[d];
-            scale[d] = (range > 0f) ? (255f / range) : 0f;
-        }
-        return scale;
+        return new Dataset(vectors, labels, count, centroids, kClusters, offsets,
+                bboxMin, bboxMax);
     }
 }

@@ -17,62 +17,66 @@ import java.util.BitSet;
 import java.util.zip.GZIPInputStream;
 
 /**
- * Converts references.json.gz into a quantized binary format for v4.
+ * v7: converts references.json.gz into an IVF index with int16 storage and
+ * per-cluster bounding boxes for exact k-NN search.
  *
- * Output (3 files in the target dir):
+ * Output (5 files in the target dir):
  *
- *   vectors-i8.bin  →  N × 14 bytes (signed int8, [-128, 127])
- *                      = ~42 MB for N = 3,000,000
- *   scales.bin      →  28 × 4 bytes (mins[14] + maxs[14], float32 LE)
- *                      = 112 bytes (kept tiny for L1 caching at runtime)
- *   labels.bin      →  ceil(N/8) bytes (bit i = 1 if vector i is fraud)
- *                      = ~375 KB
+ *   vectors-i16.bin       →  N × 14 × 2 bytes (int16 LE, scaled by 10000)
+ *                            = ~84 MB for N = 3,000,000
+ *                            VECTORS ARE REORDERED so cluster c occupies
+ *                            offsets[c]..offsets[c+1].
+ *   centroids-i16.bin     →  K × 14 × 2 bytes (int16 LE, same scaling)
+ *                            = ~7 KB for K = 256
+ *   bbox.bin              →  K × 14 × 2 × 2 bytes (min[K][14] then max[K][14])
+ *                            = ~14 KB for K = 256
+ *   cluster_offsets.bin   →  K+1 × 4 bytes (int32 LE)
+ *   labels.bin            →  ceil(N/8) bytes (bit i = 1 if vector i is fraud)
  *
- * Quantization scheme:
- *   For each dimension d:
- *     scale_d   = 255 / (max_d - min_d)
- *     int8(v)   = round((v - min_d) * scale_d) - 128
+ * Why int16 with scale 10000 (vs v4-v6's int8 with min/max scaling):
  *
- *   That maps min_d → -128 and max_d → 127. We use SIGNED int8 so the SIMD
- *   pipeline in v4's KnnSearcher can use widening B→I conversion without
- *   tripping over Java's lack of unsigned bytes.
+ *   Source data is in [-1, 1] with the 5,6 sentinel dims hitting exactly -1.
+ *   Multiplying by 10000 maps to [-10000, 10000], which fits comfortably in
+ *   int16 (±32767). That preserves ~4 decimal digits of precision —
+ *   effectively LOSSLESS vs the original float values for our purposes.
  *
- * Per-dimension min/max (vs a single global min/max):
- *   Each dim has its own native range — booleans are {0,1}, continuous dims
- *   are in [0,1], the sentinel dims (5,6) span [-1,1]. Per-dim scaling lets
- *   each dim use the full int8 resolution. The price is that the squared
- *   L2 distance computed in int8 space is a *weighted* L2 in float space,
- *   with weights 1/step_d² where step_d = (max_d - min_d) / 255. For our
- *   data most ranges are ≈1, so weights are nearly uniform — the parity
- *   test verifies this is OK (top-5 sets agree >99% with float32 ground
- *   truth on synthetic data).
+ *   Quantization step: 1/10000 = 0.0001. Compare to v4-v6's int8 step of
+ *   1/127 ≈ 0.008 — almost two orders of magnitude tighter. The cost is
+ *   2× memory (84 MB vs 42 MB), still well under the 350 MB rinha cap.
+ *
+ *   The bonus: distance in int16 space is *exactly* the float distance × 1e8.
+ *   No per-dim weighting headaches. Same ordering as float32 brute force.
+ *
+ * Why per-cluster bounding boxes:
+ *
+ *   With BB pruning, v7's KnnSearcher can use nprobe=1 + exact repair: it
+ *   scans the single closest cluster first, then for each OTHER cluster
+ *   computes a lower-bound distance from the query to the cluster's
+ *   bounding box. If that lower bound is already worse than the current
+ *   top-5 worst, the cluster is provably uninteresting and gets skipped.
+ *   This recovers exact k-NN with most clusters never scanned.
  *
  * How to run:
- *   java -cp target/classes \
- *        --add-modules=jdk.incubator.vector \
- *        com.andre.rinha.prep.DatasetBuilder \
+ *   java -cp target/classes com.andre.rinha.prep.DatasetBuilder \
  *        references.json.gz ./data
  *
- * Build-time peak heap: ~168 MB (we hold all float vectors in RAM during
- * the single streaming pass — easier than two passes over the 16 MB gzip).
- * Run with -Xmx384m or larger.
+ * Build-time peak heap: ~168 MB. Run with -Xmx384m or larger.
  */
 public final class DatasetBuilder {
 
     private static final int DIMS = 14;
     private static final int LOG_EVERY = 1_000_000;
 
-    /** v5: number of clusters for IVF coarse partitioning. */
+    /** Quantization scale: float × SCALE → int16. */
+    private static final int SCALE = 10_000;
+
+    /** Number of clusters for IVF coarse partitioning. */
     private static final int K_CLUSTERS = 256;
-    /** v5: max iterations for Lloyd's k-means. */
+    /** Max iterations for Lloyd's k-means. */
     private static final int KMEANS_MAX_ITERS = 20;
-    /** v5: deterministic seed so the dataset build is reproducible. */
+    /** Deterministic seed so the dataset build is reproducible. */
     private static final long KMEANS_SEED = 42L;
 
-    /**
-     * Initial capacity for the streaming buffer. The official dataset is 3M
-     * but we don't hardcode — we grow geometrically if the input exceeds.
-     */
     private static final int INITIAL_CAPACITY = 3_000_000;
 
     public static void main(String[] args) throws IOException {
@@ -84,11 +88,11 @@ public final class DatasetBuilder {
         Path outDir = Path.of(args[1]);
         outDir.toFile().mkdirs();
 
-        Path vectorsPath   = outDir.resolve("vectors-i8.bin");
-        Path scalesPath    = outDir.resolve("scales.bin");
-        Path labelsPath    = outDir.resolve("labels.bin");
-        Path centroidsPath = outDir.resolve("centroids.bin");
+        Path vectorsPath   = outDir.resolve("vectors-i16.bin");
+        Path centroidsPath = outDir.resolve("centroids-i16.bin");
+        Path bboxPath      = outDir.resolve("bbox.bin");
         Path offsetsPath   = outDir.resolve("cluster_offsets.bin");
+        Path labelsPath    = outDir.resolve("labels.bin");
         Path metaPath      = outDir.resolve("meta.txt");
 
         long t0 = System.currentTimeMillis();
@@ -112,12 +116,10 @@ public final class DatasetBuilder {
                 if (c == ']') break;
                 if (c == ',') { js.read(); js.skipWs(); }
 
-                // Each entry: { "vector": [...], "label": "fraud"|"legit" }
                 js.expect('{');
                 boolean isFraud = false;
                 int dim = 0;
 
-                // Grow buffer if needed (doubling, rare).
                 if ((count + 1) * DIMS > vectorsF.length) {
                     vectorsF = Arrays.copyOf(vectorsF, vectorsF.length * 2);
                 }
@@ -161,72 +163,30 @@ public final class DatasetBuilder {
             }
         }
 
-        System.out.printf("[builder] read %d vectors in %.1fs, computing global min/max%n",
+        System.out.printf("[builder] read %d vectors in %.1fs%n",
                 count, (System.currentTimeMillis() - t0) / 1000.0);
 
-        // ---- Pass 2: compute GLOBAL min/max (same scale for all dims) ----
+        // ---- Pass 2: quantize float → int16 (× SCALE) ----
         //
-        // We initially designed this with per-dimension min/max to give each
-        // dim full int8 resolution. The math works out to a per-dim *weighted*
-        // L2 distance — and our data has a sentinel dim (range = 2) alongside
-        // booleans (range = 1), so the weights came out to a ~4x ratio. The
-        // parity test (int8 vs float32 ground truth) crashed to 14% top-5
-        // agreement, way under our 95% target.
-        //
-        // Switching to a global min/max means every dim shares the same
-        // quantization step, so int8 distance is just a constant scaling of
-        // the float32 distance — ordering is preserved up to rounding noise.
-        // We still pay a precision cost: dims in [0, 1] only use ~half the
-        // int8 range when the global range is [-1, 1] (because of sentinels).
-        // Half resolution = 128 distinct values per dim — empirically enough
-        // for our case (verified by the parity test, now passing >99%).
-        float globalMin = Float.POSITIVE_INFINITY;
-        float globalMax = Float.NEGATIVE_INFINITY;
-        for (int i = 0; i < count * DIMS; i++) {
-            float v = vectorsF[i];
-            if (v < globalMin) globalMin = v;
-            if (v > globalMax) globalMax = v;
-        }
-
-        // The Dataset API still takes per-dim mins[]/maxs[] arrays — we just
-        // populate them all with the same global values. Keeps the storage
-        // format flexible if we ever revisit per-dim later.
-        float[] mins = new float[DIMS];
-        float[] maxs = new float[DIMS];
-        Arrays.fill(mins, globalMin);
-        Arrays.fill(maxs, globalMax);
-
-        System.out.printf("[builder] global range: min=%+.4f max=%+.4f step=%.6f%n",
-                globalMin, globalMax, (globalMax - globalMin) / 255f);
-
-        // ---- Pass 3: quantize float → int8 ----
-        // Pre-compute scale factors so the inner loop is just one mul.
-        float[] scaleFactor = new float[DIMS];
-        for (int d = 0; d < DIMS; d++) {
-            float range = maxs[d] - mins[d];
-            scaleFactor[d] = (range > 0f) ? (255f / range) : 0f;
-        }
-
-        byte[] vectorsI8 = new byte[count * DIMS];
+        // Source data is in [-1, 1]. After × 10000 it lands in [-10000, 10000],
+        // safely under short max ±32767. We still clamp defensively just in
+        // case some input has rounding overshoot.
+        short[] vectorsI16 = new short[count * DIMS];
         for (int i = 0; i < count; i++) {
             int base = i * DIMS;
             for (int d = 0; d < DIMS; d++) {
-                float v = vectorsF[base + d];
-                int q = Math.round((v - mins[d]) * scaleFactor[d]) - 128;
-                // Clamp defensively — covers float rounding at the edges
-                if (q < -128) q = -128;
-                if (q >  127) q =  127;
-                vectorsI8[base + d] = (byte) q;
+                int q = Math.round(vectorsF[base + d] * SCALE);
+                if (q < Short.MIN_VALUE) q = Short.MIN_VALUE;
+                if (q > Short.MAX_VALUE) q = Short.MAX_VALUE;
+                vectorsI16[base + d] = (short) q;
             }
         }
 
-        // ---- Pass 4 (v5): k-means clustering for IVF ----
+        // ---- Pass 3: k-means clustering (still uses float vectors) ----
         //
-        // We cluster on the FLOAT vectors (not int8). Why: clustering quality
-        // matters more than uniformity with the rest of the pipeline; using
-        // float gives better centroid placement, which directly affects
-        // search recall. The int8 vectors we already built will be reordered
-        // by cluster afterwards.
+        // We cluster on the FLOAT vectors because clustering quality matters
+        // and float gives the cleanest centroids. The int16 vectors we just
+        // built will be reordered by cluster after.
         System.out.printf("%n[builder] running k-means: K=%d, max_iters=%d, seed=%d%n",
                 K_CLUSTERS, KMEANS_MAX_ITERS, KMEANS_SEED);
         long tKmeans = System.currentTimeMillis();
@@ -235,30 +195,16 @@ public final class DatasetBuilder {
         System.out.printf("[builder] k-means done in %.1fs (%d iterations)%n",
                 (System.currentTimeMillis() - tKmeans) / 1000.0, km.iterations());
 
-        // Free the big float[] now that k-means is done — we still have to
-        // do the reorder + writes, and 168 MB of floats no longer needs to
-        // live in heap.
-        vectorsF = null;
+        vectorsF = null;  // free the big float buffer
 
-        // ---- Pass 5 (v5): reorder vectors and labels by cluster ----
-        //
-        // After this step, vectors-i8.bin and labels.bin look like:
-        //   [all vectors of cluster 0][all vectors of cluster 1]...[all vectors of cluster K-1]
-        // The cluster_offsets.bin file gives the inclusive start and exclusive
-        // end of each cluster, so KnnSearcher can scan a cluster as a
-        // contiguous range — perfect for cache locality and simple SIMD.
+        // ---- Pass 4: reorder vectors and labels by cluster ----
         int[] assignments = km.assignments();
-
         int[] counts = new int[K_CLUSTERS];
         for (int a : assignments) counts[a]++;
-
         int[] offsets = new int[K_CLUSTERS + 1];
         for (int c = 0; c < K_CLUSTERS; c++) offsets[c + 1] = offsets[c] + counts[c];
 
-        // Histogram diagnostic — helps spot pathological cluster imbalance.
-        int minCluster = Integer.MAX_VALUE;
-        int maxCluster = 0;
-        int emptyCount = 0;
+        int minCluster = Integer.MAX_VALUE, maxCluster = 0, emptyCount = 0;
         for (int n : counts) {
             if (n == 0) emptyCount++;
             if (n < minCluster) minCluster = n;
@@ -267,32 +213,73 @@ public final class DatasetBuilder {
         System.out.printf("[builder] cluster size: min=%d max=%d mean=%d empty=%d%n",
                 minCluster, maxCluster, count / K_CLUSTERS, emptyCount);
 
-        // Allocate the new layout. We use a working write-position copy of
-        // offsets so we can fill in place.
-        byte[] reorderedVecs = new byte[count * DIMS];
+        short[] reorderedVecs = new short[count * DIMS];
         BitSet reorderedLabels = new BitSet(count);
         int[] writePos = offsets.clone();
         for (int oldIdx = 0; oldIdx < count; oldIdx++) {
             int c = assignments[oldIdx];
             int newIdx = writePos[c]++;
-            System.arraycopy(vectorsI8, oldIdx * DIMS, reorderedVecs, newIdx * DIMS, DIMS);
+            System.arraycopy(vectorsI16, oldIdx * DIMS, reorderedVecs, newIdx * DIMS, DIMS);
             if (labels.get(oldIdx)) reorderedLabels.set(newIdx);
         }
-        // Free original (unreordered) byte[] now.
-        vectorsI8 = null;
+        vectorsI16 = null;
         labels = null;
 
+        // ---- Pass 5: compute per-cluster bounding boxes (in int16 space) ----
+        //
+        // For each cluster c and each dim d: bbox_min[c][d] = min over all
+        // vectors in cluster c of vector[d]. Same for max. These tell us the
+        // tightest axis-aligned box that contains every vector in cluster c.
+        //
+        // KnnSearcher uses these to compute a lower-bound distance from the
+        // query to the cluster. If that lower bound exceeds the current top-5
+        // worst, we can skip the whole cluster with mathematical certainty.
+        short[] bboxMin = new short[K_CLUSTERS * DIMS];
+        short[] bboxMax = new short[K_CLUSTERS * DIMS];
+        for (int c = 0; c < K_CLUSTERS; c++) {
+            int base = c * DIMS;
+            for (int d = 0; d < DIMS; d++) {
+                bboxMin[base + d] = Short.MAX_VALUE;
+                bboxMax[base + d] = Short.MIN_VALUE;
+            }
+            int start = offsets[c];
+            int end = offsets[c + 1];
+            for (int i = start; i < end; i++) {
+                int vBase = i * DIMS;
+                for (int d = 0; d < DIMS; d++) {
+                    short v = reorderedVecs[vBase + d];
+                    if (v < bboxMin[base + d]) bboxMin[base + d] = v;
+                    if (v > bboxMax[base + d]) bboxMax[base + d] = v;
+                }
+            }
+            // For empty clusters, leave bbox at MAX/MIN so the lower-bound
+            // distance becomes huge → search auto-skips them.
+        }
+
+        // ---- Convert centroids to int16 (same scale as data) ----
+        float[] centroidsF = km.centroids();
+        short[] centroidsI16 = new short[centroidsF.length];
+        for (int i = 0; i < centroidsF.length; i++) {
+            int q = Math.round(centroidsF[i] * SCALE);
+            if (q < Short.MIN_VALUE) q = Short.MIN_VALUE;
+            if (q > Short.MAX_VALUE) q = Short.MAX_VALUE;
+            centroidsI16[i] = (short) q;
+        }
+
         // ---- Write output files ----
-        Files.write(vectorsPath, reorderedVecs);
+        Files.write(vectorsPath, shortsToBytes(reorderedVecs));
+        Files.write(centroidsPath, shortsToBytes(centroidsI16));
 
-        ByteBuffer scalesBuf = ByteBuffer
-                .allocate((mins.length + maxs.length) * 4)
-                .order(ByteOrder.LITTLE_ENDIAN);
-        for (float m : mins) scalesBuf.putFloat(m);
-        for (float m : maxs) scalesBuf.putFloat(m);
-        Files.write(scalesPath, scalesBuf.array());
+        // bbox.bin: mins first (K*DIMS shorts), then maxs (K*DIMS shorts).
+        short[] bboxConcat = new short[bboxMin.length + bboxMax.length];
+        System.arraycopy(bboxMin, 0, bboxConcat, 0, bboxMin.length);
+        System.arraycopy(bboxMax, 0, bboxConcat, bboxMin.length, bboxMax.length);
+        Files.write(bboxPath, shortsToBytes(bboxConcat));
 
-        // Labels — BitSet → packed bytes, bit order matches v2/v3/v4 readers.
+        ByteBuffer offBuf = ByteBuffer.allocate((K_CLUSTERS + 1) * 4).order(ByteOrder.LITTLE_ENDIAN);
+        for (int o : offsets) offBuf.putInt(o);
+        Files.write(offsetsPath, offBuf.array());
+
         int byteCount = (count + 7) / 8;
         byte[] labelBytes = new byte[byteCount];
         for (int i = 0; i < count; i++) {
@@ -304,23 +291,10 @@ public final class DatasetBuilder {
             out.write(labelBytes);
         }
 
-        // Centroids — flat float32 LE, shape [K * DIMS].
-        ByteBuffer centBuf = ByteBuffer
-                .allocate(K_CLUSTERS * DIMS * 4)
-                .order(ByteOrder.LITTLE_ENDIAN);
-        for (float v : km.centroids()) centBuf.putFloat(v);
-        Files.write(centroidsPath, centBuf.array());
-
-        // Cluster offsets — int32 LE, length K+1.
-        ByteBuffer offBuf = ByteBuffer
-                .allocate((K_CLUSTERS + 1) * 4)
-                .order(ByteOrder.LITTLE_ENDIAN);
-        for (int o : offsets) offBuf.putInt(o);
-        Files.write(offsetsPath, offBuf.array());
-
         Files.writeString(metaPath,
                 "count=" + count + "\n"
               + "fraud=" + fraudCount + "\n"
+              + "scale=" + SCALE + "\n"
               + "k=" + K_CLUSTERS + "\n"
               + "kmeans_iters=" + km.iterations() + "\n"
               + "cluster_min=" + minCluster + "\n"
@@ -329,18 +303,20 @@ public final class DatasetBuilder {
         System.out.printf("%n[builder] OK: %d vectors, %d frauds (%.2f%%) in %.1fs%n",
                 count, fraudCount, fraudCount * 100.0 / count,
                 (System.currentTimeMillis() - t0) / 1000.0);
-        System.out.printf("[builder] sizes: vectors-i8=%d  scales=%d  labels=%d  centroids=%d  offsets=%d%n",
-                Files.size(vectorsPath), Files.size(scalesPath), Files.size(labelsPath),
-                Files.size(centroidsPath), Files.size(offsetsPath));
+        System.out.printf("[builder] sizes: vectors=%d  centroids=%d  bbox=%d  offsets=%d  labels=%d%n",
+                Files.size(vectorsPath), Files.size(centroidsPath),
+                Files.size(bboxPath), Files.size(offsetsPath), Files.size(labelsPath));
+    }
+
+    /** Pack short[] into little-endian byte[] for file output. */
+    private static byte[] shortsToBytes(short[] src) {
+        ByteBuffer bb = ByteBuffer.allocate(src.length * 2).order(ByteOrder.LITTLE_ENDIAN);
+        for (short s : src) bb.putShort(s);
+        return bb.array();
     }
 
     /* -------------------- Minimal streaming JSON tokenizer -------------------- */
 
-    /**
-     * Streaming JSON tokenizer over an InputStream. Doesn't load everything
-     * into memory. Simplified version of JsonReader, adapted for incremental
-     * parsing.
-     */
     private static final class JsonStream {
         private final InputStream in;
         private int peeked = -2;
@@ -382,7 +358,7 @@ public final class DatasetBuilder {
                 if (c == '"') break;
                 if (c == '\\') {
                     int esc = read();
-                    sb.append((char) esc); // dataset doesn't use unicode escapes
+                    sb.append((char) esc);
                 } else {
                     sb.append((char) c);
                 }

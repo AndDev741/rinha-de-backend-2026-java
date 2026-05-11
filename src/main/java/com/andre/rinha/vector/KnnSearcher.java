@@ -1,242 +1,261 @@
 package com.andre.rinha.vector;
 
-import jdk.incubator.vector.ByteVector;
-import jdk.incubator.vector.FloatVector;
-import jdk.incubator.vector.VectorMask;
-import jdk.incubator.vector.VectorOperators;
-import jdk.incubator.vector.VectorSpecies;
-
 /**
- * v5 IVF (Inverted File) k-NN search.
+ * v7 IVF k-NN with bounding-box repair — exact top-5 with aggressive pruning.
  *
- * Algorithm:
- *   1. Quantize the float query into byte[14] using Dataset.quantize.
- *   2. Compute float distance from the query to each of the K centroids
- *      (small loop, K * DIMS ops, fully cache-resident).
- *   3. Pick the NPROBE clusters with the smallest distances.
- *   4. For each picked cluster, scan ONLY the vectors in that cluster's
- *      contiguous range using the v4 hybrid SIMD distance (B→F + FMA).
- *   5. Maintain a top-K=5 max-heap across all probed clusters.
+ * Algorithm per request:
+ *   1. Quantize the float query into short[14] (× 10000 scaling).
+ *   2. Compute squared int distance from query to all K centroids.
+ *      Pick the single nearest cluster.
+ *   3. Scan all vectors in that cluster (scalar manual loop with early-exit
+ *      per dimension), maintaining top-5 in five long fields.
+ *   4. For each OTHER cluster, compute the lower-bound distance from the
+ *      query to the cluster's axis-aligned bounding box. If the bound
+ *      exceeds the current top-5 worst, the whole cluster is provably
+ *      uninteresting — skip it. Otherwise scan it and update top-5.
+ *   5. Count frauds among the top-5.
  *
- * Why this is dramatically faster than brute force:
- *   v4 does 3M × 14 = 42M ops per request.
- *   v5 does K × DIMS  +  NPROBE × (N/K) × DIMS
- *        = 256 × 14   +  3 × ~12k × 14
- *        ≈ 3.6 k      +  500 k
- *        ≈ 504 k ops per request
- *   That's ~80× fewer comparisons than v4.
+ * Why this is fast AND exact:
+ *   - With well-clustered data and a tight initial top-5 from the closest
+ *     cluster, the bbox check rejects most other clusters in constant time
+ *     (one accumulating loop over 14 dims with a short-circuit on overshoot).
+ *   - When a cluster is scanned, the inner per-vector loop is 14 scalar int
+ *     subtractions+squares with `if (dist > worst) continue` between dims —
+ *     the JIT/C2 inlines and (where possible) auto-vectorizes this. AOT
+ *     (GraalVM) also handles scalar shorts well.
+ *   - No approximation: same top-5 as float32 brute force, up to int16
+ *     rounding (~0.0001 per dim, negligible).
  *
- * Recall:
- *   The true top-5 may straddle cluster boundaries — IVF is approximate.
- *   With NPROBE=3, the top 3 nearest clusters cover ~95-98% of true top-5
- *   on real data. The parity test verifies this on synthetic data.
+ * Why no Vector API:
+ *   v6 demonstrated that explicit jdk.incubator.vector ops (convertShape,
+ *   fma) don't compile well under GraalVM native-image, and even under JIT
+ *   they tie or lose to a tight scalar loop for 14 dims with early-exit.
+ *   Scalar wins for THIS problem shape (small DIMS, big speedup possible
+ *   from per-dim short-circuit).
  *
- * Layout reminder:
- *   Dataset.vectors() is REORDERED so cluster c occupies
- *   [clusterStart(c), clusterEnd(c)). One contiguous range per cluster
- *   means cache prefetchers love this loop.
+ * Top-5 representation:
+ *   Five long distances (d0..d4) and five int positions (pos0..pos4)
+ *   stored as plain fields. No heap, no array. The JIT keeps them in
+ *   registers across the hot loop, and the `add()` cascade does only as
+ *   much shifting as needed — usually replacing just one or two slots.
  */
 public final class KnnSearcher {
 
     public static final int K = 5;
-    /** Number of nearest clusters to scan per query. */
-    public static final int NPROBE = 3;
-
-    private static final VectorSpecies<Byte>  BSPECIES = ByteVector.SPECIES_64;
-    private static final VectorSpecies<Float> FSPECIES = FloatVector.SPECIES_256;
-
-    private static final int LOOP_BOUND = BSPECIES.loopBound(Dataset.DIMS);
-    private static final VectorMask<Byte>  TAIL_MASK_B = BSPECIES.indexInRange(LOOP_BOUND, Dataset.DIMS);
-    private static final VectorMask<Float> TAIL_MASK_F = FSPECIES.indexInRange(LOOP_BOUND, Dataset.DIMS);
 
     private final Dataset dataset;
 
-    // Reusable buffers — KnnSearcher is stateful per instance, one per thread.
-    private final byte[]  qBytes        = new byte[Dataset.DIMS];
-    private final float[] heapDist      = new float[K];
-    private final int[]   heapIdx       = new int[K];
-    private final float[] centroidDist;          // [K], dynamically sized at construction
-    private final int[]   probeIds      = new int[NPROBE];
-    private final float[] probeDist     = new float[NPROBE];
+    // Reusable per-request quantized query buffer.
+    private final short[] qBytes = new short[Dataset.DIMS];
+
+    // Top-5 slot state (inlined; rebuilt each fraudScore call).
+    private long d0, d1, d2, d3, d4;
+    private int  pos0, pos1, pos2, pos3, pos4;
 
     public KnnSearcher(Dataset dataset) {
         this.dataset = dataset;
-        this.centroidDist = new float[dataset.k()];
     }
 
     public static String simdInfo() {
-        return "B" + BSPECIES.length() + " → F" + FSPECIES.length()
-                + " (BSPECIES=" + BSPECIES + ", FSPECIES=" + FSPECIES
-                + ", LOOP_BOUND=" + LOOP_BOUND + ", NPROBE=" + NPROBE + ")";
+        return "scalar int16 (no Vector API), bbox-repair IVF";
     }
 
-    /** Computes fraud_score = (#frauds among K nearest neighbors) / K. */
+    /** Computes fraud_score = (#frauds in top-5) / 5. */
     public float fraudScore(float[] query) {
-        // 1. Quantize the query (used for the bucket scan).
-        dataset.quantize(query, qBytes);
+        // 1. Quantize the query.
+        Dataset.quantize(query, qBytes);
 
-        // 2. Compute float distance from query to all centroids.
-        //    Pre-load query as FloatVector once.
-        final FloatVector qfFull = FloatVector.fromArray(FSPECIES, query, 0);
-        final FloatVector qfTail = FloatVector.fromArray(FSPECIES, query, LOOP_BOUND, TAIL_MASK_F);
-
-        final float[] centroids = dataset.centroids();
+        // 2. Find the nearest cluster via centroid distance.
+        final short[] centroids = dataset.centroids();
         final int kClusters = dataset.k();
+        int chosen = 0;
+        long bestD = Long.MAX_VALUE;
         for (int c = 0; c < kClusters; c++) {
-            centroidDist[c] = squaredDistanceFloat(qfFull, qfTail, centroids, c * Dataset.DIMS);
-        }
-
-        // 3. Find the nearest clusters (clamped to NPROBE — or all clusters
-        //    if there are fewer than NPROBE, which happens in tests).
-        int actualNprobe = findTopNprobe(kClusters);
-
-        // 4. Pre-load the int8 query as a pair of FloatVectors for the
-        //    hybrid B→F SIMD path used inside the buckets.
-        final FloatVector qbFull = LOOP_BOUND > 0
-                ? widenByteToFloat(ByteVector.fromArray(BSPECIES, qBytes, 0))
-                : null;
-        final FloatVector qbTail = widenByteToFloat(
-                ByteVector.fromArray(BSPECIES, qBytes, LOOP_BOUND, TAIL_MASK_B));
-
-        // 5. Scan each chosen cluster.
-        //    Initialize the heap with the first K candidates from the FIRST
-        //    probed cluster (assumed >= K vectors — true for K=256, N=3M
-        //    where average cluster size is ~12k).
-        final byte[] vecs = dataset.vectors();
-        boolean heapInitialized = false;
-
-        for (int p = 0; p < actualNprobe; p++) {
-            int clusterId = probeIds[p];
-            int start = dataset.clusterStart(clusterId);
-            int end   = dataset.clusterEnd(clusterId);
-
-            int i = start;
-
-            if (!heapInitialized) {
-                int initEnd = Math.min(start + K, end);
-                for (; i < initEnd; i++) {
-                    heapDist[i - start] = squaredDistanceByteHybrid(qbFull, qbTail, vecs, i * Dataset.DIMS);
-                    heapIdx[i - start]  = i;
-                }
-                if (i - start == K) {
-                    // Heapify
-                    for (int h = K / 2 - 1; h >= 0; h--) siftDown(h);
-                    heapInitialized = true;
-                }
-                // If a single tiny cluster didn't reach K we'll continue
-                // filling on the next probe iteration.
-            }
-
-            for (; i < end; i++) {
-                float d = squaredDistanceByteHybrid(qbFull, qbTail, vecs, i * Dataset.DIMS);
-                if (d < heapDist[0]) {
-                    heapDist[0] = d;
-                    heapIdx[0] = i;
-                    siftDown(0);
-                }
+            long d = centroidDistance(centroids, c);
+            if (d < bestD) {
+                bestD = d;
+                chosen = c;
             }
         }
 
-        // 6. Count frauds among the K winners.
+        // 3. Reset top-5 and scan the chosen cluster.
+        resetTop();
+        scanCluster(chosen);
+
+        // 4. Bbox repair pass: visit every OTHER cluster and prune via
+        //    lower-bound distance. Empty clusters have a huge bbox (we
+        //    initialized them with MAX/MIN at build time) so they auto-skip.
+        final short[] bbMin = dataset.bboxMin();
+        final short[] bbMax = dataset.bboxMax();
+        for (int c = 0; c < kClusters; c++) {
+            if (c == chosen) continue;
+            long worst = d4;
+            if (bboxMayBeat(bbMin, bbMax, c, worst)) {
+                scanCluster(c);
+            }
+        }
+
+        // 5. Count frauds.
         return countFrauds() / (float) K;
     }
 
     /* =================================================================== *
-     * Centroid distance: pure float SIMD                                   *
+     * Centroid distance — scalar manual unrolled                           *
      * =================================================================== */
 
-    private static float squaredDistanceFloat(FloatVector qFull, FloatVector qTail,
-                                              float[] centroids, int off) {
-        FloatVector cFull = FloatVector.fromArray(FSPECIES, centroids, off);
-        FloatVector cTail = FloatVector.fromArray(FSPECIES, centroids, off + LOOP_BOUND, TAIL_MASK_F);
-        FloatVector diffFull = qFull.sub(cFull);
-        FloatVector sum = diffFull.fma(diffFull, FloatVector.zero(FSPECIES));
-        FloatVector diffTail = qTail.sub(cTail);
-        sum = diffTail.fma(diffTail, sum);
-        return sum.reduceLanes(VectorOperators.ADD);
-    }
+    private long centroidDistance(short[] centroids, int c) {
+        final int base = c * Dataset.DIMS;
+        final short[] q = qBytes;
+        long s = 0;
+        int x;
 
-    /**
-     * Find the top-min(NPROBE, kClusters) smallest values in centroidDist[0..k).
-     *
-     * Returns the actual number of probes (= min(NPROBE, kClusters)), useful
-     * for the test-only case where the dataset has fewer than NPROBE clusters.
-     *
-     * Implementation: a simple O(probeCount × K) scan — clearer than a heap
-     * and just as fast for our scale (NPROBE=3, K=256 → 768 comparisons,
-     * dwarfed by everything else).
-     */
-    private int findTopNprobe(int kClusters) {
-        int probeCount = Math.min(NPROBE, kClusters);
-        for (int p = 0; p < probeCount; p++) {
-            probeDist[p] = Float.POSITIVE_INFINITY;
-            probeIds[p] = -1;
-        }
-        for (int c = 0; c < kClusters; c++) {
-            float d = centroidDist[c];
-            int worstIdx = 0;
-            for (int p = 1; p < probeCount; p++) {
-                if (probeDist[p] > probeDist[worstIdx]) worstIdx = p;
-            }
-            if (d < probeDist[worstIdx]) {
-                probeDist[worstIdx] = d;
-                probeIds[worstIdx] = c;
-            }
-        }
-        return probeCount;
+        x = centroids[base     ] - q[0];  s += (long) x * x;
+        x = centroids[base +  1] - q[1];  s += (long) x * x;
+        x = centroids[base +  2] - q[2];  s += (long) x * x;
+        x = centroids[base +  3] - q[3];  s += (long) x * x;
+        x = centroids[base +  4] - q[4];  s += (long) x * x;
+        x = centroids[base +  5] - q[5];  s += (long) x * x;
+        x = centroids[base +  6] - q[6];  s += (long) x * x;
+        x = centroids[base +  7] - q[7];  s += (long) x * x;
+        x = centroids[base +  8] - q[8];  s += (long) x * x;
+        x = centroids[base +  9] - q[9];  s += (long) x * x;
+        x = centroids[base + 10] - q[10]; s += (long) x * x;
+        x = centroids[base + 11] - q[11]; s += (long) x * x;
+        x = centroids[base + 12] - q[12]; s += (long) x * x;
+        x = centroids[base + 13] - q[13]; s += (long) x * x;
+        return s;
     }
 
     /* =================================================================== *
-     * Bucket vector distance: hybrid B→F SIMD + FMA (same as v4)           *
+     * Bbox lower-bound — exact pruning                                     *
+     *                                                                       *
+     * For each dim d, the minimum possible squared distance from q[d] to    *
+     * ANY value in [bbMin[c,d], bbMax[c,d]] is:                             *
+     *     0                       if  bbMin[c,d] <= q[d] <= bbMax[c,d]      *
+     *     (bbMin[c,d] - q[d])^2   if  q[d] <  bbMin[c,d]                    *
+     *     (q[d] - bbMax[c,d])^2   if  q[d] >  bbMax[c,d]                    *
+     *                                                                       *
+     * Summing those per-dim minima gives a STRICT lower bound on the        *
+     * distance from q to any vector in cluster c. If that already exceeds   *
+     * the current top-5 worst, the whole cluster can be skipped.            *
      * =================================================================== */
 
-    private static float squaredDistanceByteHybrid(FloatVector qFull, FloatVector qTail,
-                                                    byte[] vecs, int off) {
-        FloatVector sum = FloatVector.zero(FSPECIES);
+    private boolean bboxMayBeat(short[] bbMin, short[] bbMax, int c, long worst) {
+        final int base = c * Dataset.DIMS;
+        final short[] q = qBytes;
+        long s = 0;
+        int v, diff;
 
-        if (qFull != null) {
-            for (int i = 0; i < LOOP_BOUND; i += BSPECIES.length()) {
-                FloatVector v = widenByteToFloat(ByteVector.fromArray(BSPECIES, vecs, off + i));
-                FloatVector diff = qFull.sub(v);
-                sum = diff.fma(diff, sum);
-            }
-        }
-        FloatVector vTail = widenByteToFloat(
-                ByteVector.fromArray(BSPECIES, vecs, off + LOOP_BOUND, TAIL_MASK_B));
-        FloatVector diffTail = qTail.sub(vTail);
-        sum = diffTail.fma(diffTail, sum);
-
-        return sum.reduceLanes(VectorOperators.ADD);
-    }
-
-    private static FloatVector widenByteToFloat(ByteVector b) {
-        return (FloatVector) b.convertShape(VectorOperators.B2F, FSPECIES, 0);
+        v = q[0];  diff = v < bbMin[base     ] ? bbMin[base     ] - v : (v > bbMax[base     ] ? v - bbMax[base     ] : 0); s += (long) diff * diff; if (s > worst) return false;
+        v = q[1];  diff = v < bbMin[base +  1] ? bbMin[base +  1] - v : (v > bbMax[base +  1] ? v - bbMax[base +  1] : 0); s += (long) diff * diff; if (s > worst) return false;
+        v = q[2];  diff = v < bbMin[base +  2] ? bbMin[base +  2] - v : (v > bbMax[base +  2] ? v - bbMax[base +  2] : 0); s += (long) diff * diff; if (s > worst) return false;
+        v = q[3];  diff = v < bbMin[base +  3] ? bbMin[base +  3] - v : (v > bbMax[base +  3] ? v - bbMax[base +  3] : 0); s += (long) diff * diff; if (s > worst) return false;
+        v = q[4];  diff = v < bbMin[base +  4] ? bbMin[base +  4] - v : (v > bbMax[base +  4] ? v - bbMax[base +  4] : 0); s += (long) diff * diff; if (s > worst) return false;
+        v = q[5];  diff = v < bbMin[base +  5] ? bbMin[base +  5] - v : (v > bbMax[base +  5] ? v - bbMax[base +  5] : 0); s += (long) diff * diff; if (s > worst) return false;
+        v = q[6];  diff = v < bbMin[base +  6] ? bbMin[base +  6] - v : (v > bbMax[base +  6] ? v - bbMax[base +  6] : 0); s += (long) diff * diff; if (s > worst) return false;
+        v = q[7];  diff = v < bbMin[base +  7] ? bbMin[base +  7] - v : (v > bbMax[base +  7] ? v - bbMax[base +  7] : 0); s += (long) diff * diff; if (s > worst) return false;
+        v = q[8];  diff = v < bbMin[base +  8] ? bbMin[base +  8] - v : (v > bbMax[base +  8] ? v - bbMax[base +  8] : 0); s += (long) diff * diff; if (s > worst) return false;
+        v = q[9];  diff = v < bbMin[base +  9] ? bbMin[base +  9] - v : (v > bbMax[base +  9] ? v - bbMax[base +  9] : 0); s += (long) diff * diff; if (s > worst) return false;
+        v = q[10]; diff = v < bbMin[base + 10] ? bbMin[base + 10] - v : (v > bbMax[base + 10] ? v - bbMax[base + 10] : 0); s += (long) diff * diff; if (s > worst) return false;
+        v = q[11]; diff = v < bbMin[base + 11] ? bbMin[base + 11] - v : (v > bbMax[base + 11] ? v - bbMax[base + 11] : 0); s += (long) diff * diff; if (s > worst) return false;
+        v = q[12]; diff = v < bbMin[base + 12] ? bbMin[base + 12] - v : (v > bbMax[base + 12] ? v - bbMax[base + 12] : 0); s += (long) diff * diff; if (s > worst) return false;
+        v = q[13]; diff = v < bbMin[base + 13] ? bbMin[base + 13] - v : (v > bbMax[base + 13] ? v - bbMax[base + 13] : 0); s += (long) diff * diff;
+        return s <= worst;
     }
 
     /* =================================================================== *
-     * Heap utilities                                                       *
+     * Cluster scan — scalar manual unrolled, early-exit per dim            *
+     *                                                                       *
+     * The JIT inlines this and (in many runs) auto-vectorizes the first    *
+     * few dims before the first short-circuit. Even when it doesn't, the   *
+     * per-dim continue keeps far candidates from paying the full 14-dim    *
+     * cost. With well-clustered data, most loop iterations terminate at    *
+     * dim 2-4.                                                              *
      * =================================================================== */
+
+    private void scanCluster(int c) {
+        final short[] vecs = dataset.vectors();
+        final short[] q = qBytes;
+        final int start = dataset.clusterStart(c);
+        final int end   = dataset.clusterEnd(c);
+
+        final int q0  = q[0],  q1  = q[1],  q2  = q[2],  q3  = q[3],
+                  q4  = q[4],  q5  = q[5],  q6  = q[6],  q7  = q[7],
+                  q8  = q[8],  q9  = q[9],  q10 = q[10], q11 = q[11],
+                  q12 = q[12], q13 = q[13];
+
+        long worst = d4;
+
+        for (int i = start; i < end; i++) {
+            int b = i * Dataset.DIMS;
+            long dist;
+            int x;
+
+            x = vecs[b     ] - q0;  dist = (long) x * x;       if (dist > worst) continue;
+            x = vecs[b +  1] - q1;  dist += (long) x * x;       if (dist > worst) continue;
+            x = vecs[b +  2] - q2;  dist += (long) x * x;       if (dist > worst) continue;
+            x = vecs[b +  3] - q3;  dist += (long) x * x;       if (dist > worst) continue;
+            x = vecs[b +  4] - q4;  dist += (long) x * x;       if (dist > worst) continue;
+            x = vecs[b +  5] - q5;  dist += (long) x * x;       if (dist > worst) continue;
+            x = vecs[b +  6] - q6;  dist += (long) x * x;       if (dist > worst) continue;
+            x = vecs[b +  7] - q7;  dist += (long) x * x;       if (dist > worst) continue;
+            x = vecs[b +  8] - q8;  dist += (long) x * x;       if (dist > worst) continue;
+            x = vecs[b +  9] - q9;  dist += (long) x * x;       if (dist > worst) continue;
+            x = vecs[b + 10] - q10; dist += (long) x * x;       if (dist > worst) continue;
+            x = vecs[b + 11] - q11; dist += (long) x * x;       if (dist > worst) continue;
+            x = vecs[b + 12] - q12; dist += (long) x * x;       if (dist > worst) continue;
+            x = vecs[b + 13] - q13; dist += (long) x * x;       if (dist > worst) continue;
+
+            insertTop(dist, i);
+            worst = d4;
+        }
+    }
+
+    /* =================================================================== *
+     * Top-5 maintenance — five long/int fields, manual cascade             *
+     *                                                                       *
+     * Invariant: d0 <= d1 <= d2 <= d3 <= d4. d4 is the worst-of-top-5      *
+     * (the "kick out" candidate).                                           *
+     * =================================================================== */
+
+    private void resetTop() {
+        d0 = d1 = d2 = d3 = d4 = Long.MAX_VALUE;
+        pos0 = pos1 = pos2 = pos3 = pos4 = -1;
+    }
+
+    private void insertTop(long dist, int pos) {
+        // dist is strictly less than d4 (caller already checked).
+        // Cascade insert in sorted order.
+        if (dist < d0) {
+            d4 = d3; pos4 = pos3;
+            d3 = d2; pos3 = pos2;
+            d2 = d1; pos2 = pos1;
+            d1 = d0; pos1 = pos0;
+            d0 = dist; pos0 = pos;
+        } else if (dist < d1) {
+            d4 = d3; pos4 = pos3;
+            d3 = d2; pos3 = pos2;
+            d2 = d1; pos2 = pos1;
+            d1 = dist; pos1 = pos;
+        } else if (dist < d2) {
+            d4 = d3; pos4 = pos3;
+            d3 = d2; pos3 = pos2;
+            d2 = dist; pos2 = pos;
+        } else if (dist < d3) {
+            d4 = d3; pos4 = pos3;
+            d3 = dist; pos3 = pos;
+        } else {
+            d4 = dist; pos4 = pos;
+        }
+    }
 
     private int countFrauds() {
         int n = 0;
-        for (int i = 0; i < K; i++) {
-            if (dataset.isFraud(heapIdx[i])) n++;
-        }
+        if (pos0 >= 0 && dataset.isFraud(pos0)) n++;
+        if (pos1 >= 0 && dataset.isFraud(pos1)) n++;
+        if (pos2 >= 0 && dataset.isFraud(pos2)) n++;
+        if (pos3 >= 0 && dataset.isFraud(pos3)) n++;
+        if (pos4 >= 0 && dataset.isFraud(pos4)) n++;
         return n;
-    }
-
-    private void siftDown(int i) {
-        final int n = K;
-        while (true) {
-            int left = 2 * i + 1;
-            int right = 2 * i + 2;
-            int largest = i;
-            if (left  < n && heapDist[left]  > heapDist[largest]) largest = left;
-            if (right < n && heapDist[right] > heapDist[largest]) largest = right;
-            if (largest == i) return;
-            float td = heapDist[i]; heapDist[i] = heapDist[largest]; heapDist[largest] = td;
-            int   ti = heapIdx[i];  heapIdx[i]  = heapIdx[largest];  heapIdx[largest]  = ti;
-            i = largest;
-        }
     }
 }

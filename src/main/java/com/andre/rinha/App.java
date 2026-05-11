@@ -12,17 +12,17 @@ import java.util.Random;
 import java.util.concurrent.Executors;
 
 /**
- * Entry point — v4 (int8 quantized dataset).
+ * Entry point — v7 (int16 IVF with bbox repair).
  *
  * Environment variables:
  *   PORT      — HTTP port (default 9999, as required by the challenge)
- *   DATA_DIR  — directory containing vectors-i8.bin + scales.bin + labels.bin
- *               (default ./data)
+ *   DATA_DIR  — directory with vectors-i16.bin, centroids-i16.bin, bbox.bin,
+ *               cluster_offsets.bin, labels.bin (default ./data)
  *   THREADS   — HttpServer thread pool size (default = number of CPUs)
  *
  * Initialization order:
- *   1. Load the int8 dataset (~42 MB instead of v1-v3's ~168 MB float32).
- *   2. JIT warmup over the int8 hot path.
+ *   1. Load the int16 IVF dataset (~84 MB heap).
+ *   2. JIT warmup over the hot path.
  *   3. Bind and start. /ready only responds once we reach this point.
  */
 public final class App {
@@ -32,14 +32,15 @@ public final class App {
         Path dataDir = Path.of(env("DATA_DIR", "./data"));
         int threads = envInt("THREADS", Runtime.getRuntime().availableProcessors());
 
-        System.out.println("[app] SIMD: " + KnnSearcher.simdInfo());
+        System.out.println("[app] search: " + KnnSearcher.simdInfo());
 
         long t0 = System.currentTimeMillis();
-        System.out.println("[app] loading int8 dataset from " + dataDir.toAbsolutePath());
+        System.out.println("[app] loading int16 IVF dataset from " + dataDir.toAbsolutePath());
         Dataset dataset = Dataset.load(dataDir);
         long loadMs = System.currentTimeMillis() - t0;
-        System.out.printf("[app] dataset loaded: %d vectors in %d ms (%.1f MB heap)%n",
-                dataset.count(), loadMs, dataset.vectors().length / (1024.0 * 1024.0));
+        System.out.printf("[app] dataset loaded: %d vectors, %d clusters in %d ms (%.1f MB heap)%n",
+                dataset.count(), dataset.k(), loadMs,
+                dataset.vectors().length * 2 / (1024.0 * 1024.0));
 
         warmup(dataset);
 

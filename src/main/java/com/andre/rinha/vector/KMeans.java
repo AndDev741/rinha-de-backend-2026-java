@@ -1,77 +1,46 @@
 package com.andre.rinha.vector;
 
-import jdk.incubator.vector.FloatVector;
-import jdk.incubator.vector.VectorMask;
-import jdk.incubator.vector.VectorOperators;
-import jdk.incubator.vector.VectorSpecies;
-
 import java.util.SplittableRandom;
 
 /**
- * Lloyd's k-means with k-means++ initialization.
+ * Lloyd's k-means with k-means++ initialization. Build-time only.
  *
- * Used at build time to partition the 3M reference vectors into K clusters,
- * which v5's IVF (Inverted File) KnnSearcher uses to skip ~99% of brute-force
- * comparisons at query time.
+ * v7: rewritten to be pure scalar (no Vector API), matching the runtime
+ * KnnSearcher's philosophy. K-means is a one-time build step (~1-3 min
+ * for 3M × 256 × 20 iters); scalar with manual unrolling is fast enough
+ * and keeps the project free of incubator dependencies.
  *
- * Performance hot path is the assignment step (each iteration): for every
- * vector, compute the squared L2 distance to all K centroids and pick the
- * smallest. We do that with FloatVector + FMA so a single iteration over
- * 3M × 256 × 14 ops takes a few seconds rather than ~30s of pure scalar.
+ * Convergence: hard cap at maxIters; early stop when fewer than 0.1 % of
+ * assignments change between iterations.
  *
- * Convergence:
- *   - Hard cap at maxIters (default 20).
- *   - Early termination when fewer than 0.1% of assignments change between
- *     iterations (Lloyd's typically settles fast — most movement happens in
- *     the first 5-8 iters).
- *
- * Empty clusters: a cluster with zero assigned vectors is reseeded with a
- * random vector from the dataset. Rare but possible at high K.
+ * Empty clusters: reseeded with a random vector from the input.
  */
 public final class KMeans {
 
-    /** Result of a fit() call. */
     public record Result(
-            float[] centroids,   // [K * dims], flat layout
-            int[] assignments,   // [N] — assignment of each vector to a cluster id
+            float[] centroids,
+            int[] assignments,
             int iterations
     ) {}
 
-    private static final VectorSpecies<Float> SPECIES = FloatVector.SPECIES_PREFERRED;
-    private static final int LOOP_BOUND = SPECIES.loopBound(Dataset.DIMS);
-    private static final VectorMask<Float> TAIL_MASK = SPECIES.indexInRange(LOOP_BOUND, Dataset.DIMS);
-
     private KMeans() {}
 
-    /**
-     * Run Lloyd's k-means.
-     *
-     * @param vectors  flat [n * dims] float array of all input vectors
-     * @param n        number of vectors
-     * @param dims     dimensions per vector (must equal Dataset.DIMS so SIMD
-     *                 species line up)
-     * @param k        target number of clusters
-     * @param maxIters hard cap on iterations
-     * @param seed     for reproducibility
-     */
     public static Result fit(float[] vectors, int n, int dims, int k, int maxIters, long seed) {
         if (dims != Dataset.DIMS) {
             throw new IllegalArgumentException(
-                    "KMeans uses SIMD configured for DIMS=" + Dataset.DIMS + ", got " + dims);
+                    "KMeans expects DIMS=" + Dataset.DIMS + ", got " + dims);
         }
 
         SplittableRandom rng = new SplittableRandom(seed);
         float[] centroids = kmeansPlusPlusInit(vectors, n, dims, k, rng);
         int[] assignments = new int[n];
-        // Initial assignments: -1 means "no assignment yet" so the first iter
-        // counts every assignment as a "change" (no early stop on iter 0).
         for (int i = 0; i < n; i++) assignments[i] = -1;
 
         int iter;
         for (iter = 0; iter < maxIters; iter++) {
             long t = System.currentTimeMillis();
 
-            int changes = assignAll(vectors, n, dims, centroids, k, assignments);
+            int changes = assignAll(vectors, n, centroids, k, assignments);
 
             updateCentroids(vectors, n, dims, assignments, centroids, k, rng);
 
@@ -79,8 +48,6 @@ public final class KMeans {
             System.out.printf("[kmeans] iter %2d: %.2f%% reassigned (%d), %.1fs%n",
                     iter, pct, changes, (System.currentTimeMillis() - t) / 1000.0);
 
-            // Early termination: < 0.1% movement and we've done at least 5
-            // iterations (so the first few aren't tricked by lucky init).
             if (iter >= 5 && pct < 0.1) {
                 System.out.printf("[kmeans] converged after %d iterations%n", iter + 1);
                 iter++;
@@ -91,35 +58,25 @@ public final class KMeans {
         return new Result(centroids, assignments, iter);
     }
 
-    /* ===================================================================
-     * K-means++ initialization
-     *
-     * Pick the first centroid uniformly. For each subsequent centroid c_i,
-     * sample a vector with probability proportional to D(x)², where D(x) is
-     * the distance from x to its nearest already-chosen centroid. This
-     * spreads centroids well across the data — pure random init can produce
-     * very unbalanced clusters.
-     * ================================================================== */
+    /* =================================================================== *
+     * K-means++ initialization                                             *
+     * =================================================================== */
     private static float[] kmeansPlusPlusInit(float[] vectors, int n, int dims, int k,
                                               SplittableRandom rng) {
         float[] centroids = new float[k * dims];
 
-        // First centroid: uniform random.
         int firstIdx = rng.nextInt(n);
         System.arraycopy(vectors, firstIdx * dims, centroids, 0, dims);
 
-        // Per-vector squared distance to the closest already-chosen centroid.
         float[] minDistSq = new float[n];
         for (int i = 0; i < n; i++) {
-            minDistSq[i] = squaredDistanceFloat(vectors, i * dims, centroids, 0, dims);
+            minDistSq[i] = squaredDistance(vectors, i * dims, centroids, 0);
         }
 
         for (int c = 1; c < k; c++) {
-            // Total of D(x)² across all vectors.
             double total = 0;
             for (int i = 0; i < n; i++) total += minDistSq[i];
 
-            // Sample proportional to D(x)².
             double r = rng.nextDouble() * total;
             double acc = 0;
             int pickIdx = n - 1;
@@ -129,10 +86,9 @@ public final class KMeans {
             }
             System.arraycopy(vectors, pickIdx * dims, centroids, c * dims, dims);
 
-            // Update minDistSq with the new centroid.
             int cBase = c * dims;
             for (int i = 0; i < n; i++) {
-                float d = squaredDistanceFloat(vectors, i * dims, centroids, cBase, dims);
+                float d = squaredDistance(vectors, i * dims, centroids, cBase);
                 if (d < minDistSq[i]) minDistSq[i] = d;
             }
         }
@@ -140,38 +96,46 @@ public final class KMeans {
         return centroids;
     }
 
-    /* ===================================================================
-     * Assignment step — SIMD-accelerated.
-     *
-     * For each vector, find the centroid with the smallest squared distance.
-     * Returns the count of vectors whose assignment changed (used for
-     * early-termination decision in the outer loop).
-     *
-     * We pre-load each vector into a pair of FloatVectors once and iterate
-     * the K centroids in the inner loop — keeps the vector in registers
-     * and only re-reads the centroid table (which fits in L1 for K=256).
-     * ================================================================== */
-    private static int assignAll(float[] vectors, int n, int dims,
+    /* =================================================================== *
+     * Assignment step — scalar manual unrolled                             *
+     *                                                                       *
+     * For each vector, scan all K centroids and pick the nearest. The      *
+     * inner per-centroid distance is fully unrolled across the 14 dims so  *
+     * the JIT can spill q[*] into registers and stream through the         *
+     * centroids array sequentially.                                        *
+     * =================================================================== */
+    private static int assignAll(float[] vectors, int n,
                                   float[] centroids, int k, int[] assignments) {
         int changes = 0;
         for (int i = 0; i < n; i++) {
-            int base = i * dims;
-            FloatVector qFull = FloatVector.fromArray(SPECIES, vectors, base);
-            FloatVector qTail = FloatVector.fromArray(SPECIES, vectors, base + LOOP_BOUND, TAIL_MASK);
+            int b = i * Dataset.DIMS;
+            float q0  = vectors[b],     q1  = vectors[b + 1],  q2  = vectors[b + 2];
+            float q3  = vectors[b + 3], q4  = vectors[b + 4],  q5  = vectors[b + 5];
+            float q6  = vectors[b + 6], q7  = vectors[b + 7],  q8  = vectors[b + 8];
+            float q9  = vectors[b + 9], q10 = vectors[b + 10], q11 = vectors[b + 11];
+            float q12 = vectors[b + 12], q13 = vectors[b + 13];
 
             int bestK = 0;
             float bestDist = Float.MAX_VALUE;
+
             for (int c = 0; c < k; c++) {
-                int cBase = c * dims;
-                FloatVector cFull = FloatVector.fromArray(SPECIES, centroids, cBase);
-                FloatVector cTail = FloatVector.fromArray(SPECIES, centroids, cBase + LOOP_BOUND, TAIL_MASK);
+                int cb = c * Dataset.DIMS;
+                float x, dist;
+                x = centroids[cb     ] - q0;  dist  = x * x;
+                x = centroids[cb +  1] - q1;  dist += x * x;
+                x = centroids[cb +  2] - q2;  dist += x * x;
+                x = centroids[cb +  3] - q3;  dist += x * x;
+                x = centroids[cb +  4] - q4;  dist += x * x;
+                x = centroids[cb +  5] - q5;  dist += x * x;
+                x = centroids[cb +  6] - q6;  dist += x * x;
+                x = centroids[cb +  7] - q7;  dist += x * x;
+                x = centroids[cb +  8] - q8;  dist += x * x;
+                x = centroids[cb +  9] - q9;  dist += x * x;
+                x = centroids[cb + 10] - q10; dist += x * x;
+                x = centroids[cb + 11] - q11; dist += x * x;
+                x = centroids[cb + 12] - q12; dist += x * x;
+                x = centroids[cb + 13] - q13; dist += x * x;
 
-                FloatVector diffFull = qFull.sub(cFull);
-                FloatVector sum = diffFull.fma(diffFull, FloatVector.zero(SPECIES));
-                FloatVector diffTail = qTail.sub(cTail);
-                sum = diffTail.fma(diffTail, sum);
-
-                float dist = sum.reduceLanes(VectorOperators.ADD);
                 if (dist < bestDist) {
                     bestDist = dist;
                     bestK = c;
@@ -186,14 +150,12 @@ public final class KMeans {
         return changes;
     }
 
-    /* ===================================================================
-     * Update step — recompute each centroid as the mean of its assigned
-     * vectors. Empty clusters are reseeded with a random vector.
-     * ================================================================== */
+    /* =================================================================== *
+     * Update step                                                          *
+     * =================================================================== */
     private static void updateCentroids(float[] vectors, int n, int dims,
                                         int[] assignments, float[] centroids, int k,
                                         SplittableRandom rng) {
-        // Zero centroids and counts.
         for (int i = 0; i < centroids.length; i++) centroids[i] = 0f;
         int[] counts = new int[k];
 
@@ -213,21 +175,15 @@ public final class KMeans {
                 float inv = 1f / counts[c];
                 for (int d = 0; d < dims; d++) centroids[base + d] *= inv;
             } else {
-                // Empty cluster — seed with a random vector. Rare but happens
-                // at high K when initial centroids cluster too tightly.
                 int rndIdx = rng.nextInt(n);
                 System.arraycopy(vectors, rndIdx * dims, centroids, c * dims, dims);
             }
         }
     }
 
-    /* ===================================================================
-     * Squared L2 distance — scalar version used during k-means++ init.
-     * The init step is O(N*K) once, so we don't bother SIMD-ifying it.
-     * ================================================================== */
-    private static float squaredDistanceFloat(float[] a, int aOff, float[] b, int bOff, int dims) {
+    private static float squaredDistance(float[] a, int aOff, float[] b, int bOff) {
         float sum = 0;
-        for (int d = 0; d < dims; d++) {
+        for (int d = 0; d < Dataset.DIMS; d++) {
             float diff = a[aOff + d] - b[bOff + d];
             sum += diff * diff;
         }

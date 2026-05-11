@@ -12,34 +12,32 @@ import java.util.Random;
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
- * v5's central correctness test: how often does IVF k-NN agree with brute
- * force on the top-5 nearest neighbors?
+ * v7's central correctness test: int16 IVF + bbox repair must match float32
+ * brute force on the top-5 nearest neighbors, modulo int16 rounding noise.
  *
- * Setup:
- *   - 10 k synthetic vectors in 14 dims, with a random sentinel-style -1 in
- *     dims 5/6 to mimic real "no last transaction" cases.
- *   - Cluster the float vectors with K=16 using {@link KMeans} (smaller K
- *     than production's 256 because N is small here — keeps clusters big
- *     enough to be meaningful, otherwise too many singleton clusters skew
- *     the test).
- *   - Quantize to int8 with global min/max (same recipe as DatasetBuilder).
- *   - Reorder vectors and labels by cluster (same recipe as DatasetBuilder).
- *   - For each random query, compute top-5 with float32 brute force (ground
- *     truth) AND with v5 IVF KnnSearcher. Measure agreement.
+ * Setup mirrors DatasetBuilder:
+ *   1. Build a synthetic float32 dataset (10 k vectors, 14 dims) with some
+ *      -1 sentinels in dims 5/6.
+ *   2. Cluster the float vectors with KMeans (K=16 for the synthetic).
+ *   3. Quantize to int16 with × 10000 scaling.
+ *   4. Reorder vectors+labels by cluster (mirrors DatasetBuilder).
+ *   5. Compute bbox per cluster.
+ *   6. For each random query, compute top-5 via:
+ *        - float32 brute force  (ground truth)
+ *        - v7 IVF + bbox repair (under test)
+ *      Compare fraud_score agreement.
  *
  * Acceptance:
- *   - fraud_score equality ≥ 80 % on synthetic uniform data (worst case).
- *   - perfect top-5 set match is *informational* — IVF is approximate by
- *     design and uniform data has lots of near-ties.
- *
- * On real fraud data (clearer cluster structure) we expect noticeably
- * higher agreement. The k6 benchmark is the final word.
+ *   With bbox repair the v7 search is EXACT — same top-5 as brute force
+ *   except for ties that fall on a 0.0001 int16 rounding boundary. We
+ *   expect >= 99% fraud_score equality even on synthetic uniform data
+ *   (which is the worst case for k-NN ordering stability).
  */
 class KnnSearcherIvfRecallTest {
 
     private static final int DIMS = Dataset.DIMS;
     private static final int N = 10_000;
-    private static final int K_CLUSTERS = 16;     // small for synthetic test
+    private static final int K_CLUSTERS = 16;
     private static final int QUERIES = 200;
     private static final int KMEANS_MAX_ITERS = 30;
     private static final long DATA_SEED = 42L;
@@ -47,8 +45,8 @@ class KnnSearcherIvfRecallTest {
     private static final long KMEANS_SEED = 11L;
 
     @Test
-    void ivfRecallVsBruteForce() {
-        // ---- Build synthetic dataset ----
+    void int16IvfBboxMatchesFloat32BruteForce() {
+        // ---- Build synthetic float dataset ----
         Random rng = new Random(DATA_SEED);
         float[] vectorsF = new float[N * DIMS];
         for (int i = 0; i < vectorsF.length; i++) {
@@ -62,68 +60,72 @@ class KnnSearcherIvfRecallTest {
             if (rng.nextFloat() < 0.30f) labelsTrue.set(i);
         }
 
-        // ---- k-means cluster the float vectors ----
+        // ---- k-means on float vectors ----
         KMeans.Result km = KMeans.fit(vectorsF, N, DIMS, K_CLUSTERS, KMEANS_MAX_ITERS, KMEANS_SEED);
 
-        // ---- Compute global mins/maxs and quantize ----
-        float globalMin = Float.POSITIVE_INFINITY;
-        float globalMax = Float.NEGATIVE_INFINITY;
-        for (float v : vectorsF) {
-            if (v < globalMin) globalMin = v;
-            if (v > globalMax) globalMax = v;
-        }
-        float[] mins = new float[DIMS];
-        float[] maxs = new float[DIMS];
-        Arrays.fill(mins, globalMin);
-        Arrays.fill(maxs, globalMax);
-
-        byte[] vectorsI8 = new byte[N * DIMS];
-        float scale = 255f / (globalMax - globalMin);
-        for (int i = 0; i < N; i++) {
-            int base = i * DIMS;
-            for (int d = 0; d < DIMS; d++) {
-                int q = Math.round((vectorsF[base + d] - globalMin) * scale) - 128;
-                if (q < -128) q = -128;
-                if (q >  127) q =  127;
-                vectorsI8[base + d] = (byte) q;
-            }
+        // ---- Quantize to int16 (× 10000) ----
+        short[] vectorsI16 = new short[N * DIMS];
+        for (int i = 0; i < N * DIMS; i++) {
+            int q = Math.round(vectorsF[i] * Dataset.SCALE);
+            if (q < Short.MIN_VALUE) q = Short.MIN_VALUE;
+            if (q > Short.MAX_VALUE) q = Short.MAX_VALUE;
+            vectorsI16[i] = (short) q;
         }
 
-        // ---- Reorder vectors+labels by cluster (mirror DatasetBuilder) ----
+        // ---- Reorder by cluster ----
         int[] assignments = km.assignments();
         int[] counts = new int[K_CLUSTERS];
         for (int a : assignments) counts[a]++;
         int[] offsets = new int[K_CLUSTERS + 1];
         for (int c = 0; c < K_CLUSTERS; c++) offsets[c + 1] = offsets[c] + counts[c];
 
-        byte[] reorderedVecs = new byte[N * DIMS];
+        short[] reorderedVecs = new short[N * DIMS];
         BitSet reorderedLabels = new BitSet(N);
-        // Track reorderedIdx → originalIdx so float-ground-truth uses the same indexing
-        int[] newToOld = new int[N];
+        float[] reorderedFloats = new float[N * DIMS];
         int[] writePos = offsets.clone();
         for (int oldIdx = 0; oldIdx < N; oldIdx++) {
             int c = assignments[oldIdx];
             int newIdx = writePos[c]++;
-            System.arraycopy(vectorsI8, oldIdx * DIMS, reorderedVecs, newIdx * DIMS, DIMS);
+            System.arraycopy(vectorsI16, oldIdx * DIMS, reorderedVecs, newIdx * DIMS, DIMS);
+            System.arraycopy(vectorsF,   oldIdx * DIMS, reorderedFloats, newIdx * DIMS, DIMS);
             if (labelsTrue.get(oldIdx)) reorderedLabels.set(newIdx);
-            newToOld[newIdx] = oldIdx;
         }
 
-        // For float ground truth we also need the floats in the same
-        // reordered layout so we compare apples to apples.
-        float[] reorderedFloats = new float[N * DIMS];
-        for (int newIdx = 0; newIdx < N; newIdx++) {
-            int oldIdx = newToOld[newIdx];
-            System.arraycopy(vectorsF, oldIdx * DIMS, reorderedFloats, newIdx * DIMS, DIMS);
+        // ---- Compute per-cluster bbox ----
+        short[] bboxMin = new short[K_CLUSTERS * DIMS];
+        short[] bboxMax = new short[K_CLUSTERS * DIMS];
+        for (int c = 0; c < K_CLUSTERS; c++) {
+            int base = c * DIMS;
+            for (int d = 0; d < DIMS; d++) {
+                bboxMin[base + d] = Short.MAX_VALUE;
+                bboxMax[base + d] = Short.MIN_VALUE;
+            }
+            for (int i = offsets[c]; i < offsets[c + 1]; i++) {
+                int vBase = i * DIMS;
+                for (int d = 0; d < DIMS; d++) {
+                    short v = reorderedVecs[vBase + d];
+                    if (v < bboxMin[base + d]) bboxMin[base + d] = v;
+                    if (v > bboxMax[base + d]) bboxMax[base + d] = v;
+                }
+            }
         }
 
-        Dataset ds = Dataset.fromArrays(reorderedVecs, reorderedLabels, mins, maxs,
-                km.centroids(), offsets);
-        KnnSearcher ivf = new KnnSearcher(ds);
+        // ---- Convert centroids to int16 too ----
+        float[] cf = km.centroids();
+        short[] centroidsI16 = new short[cf.length];
+        for (int i = 0; i < cf.length; i++) {
+            int q = Math.round(cf[i] * Dataset.SCALE);
+            if (q < Short.MIN_VALUE) q = Short.MIN_VALUE;
+            if (q > Short.MAX_VALUE) q = Short.MAX_VALUE;
+            centroidsI16[i] = (short) q;
+        }
 
-        // ---- Run comparison ----
+        Dataset ds = Dataset.fromArrays(reorderedVecs, reorderedLabels,
+                centroidsI16, offsets, bboxMin, bboxMax);
+        KnnSearcher search = new KnnSearcher(ds);
+
+        // ---- Compare ----
         Random qrng = new Random(QUERY_SEED);
-        int perfectMatch = 0;
         int scoreEqual = 0;
         for (int q = 0; q < QUERIES; q++) {
             float[] query = new float[DIMS];
@@ -135,20 +137,19 @@ class KnnSearcherIvfRecallTest {
             int[] truthTop = topKFloat32(query, reorderedFloats, N);
             float truthScore = fraudFraction(truthTop, reorderedLabels);
 
-            float ivfScore = ivf.fraudScore(query);
+            float v7Score = search.fraudScore(query);
 
-            if (Math.abs(truthScore - ivfScore) < 1e-6) scoreEqual++;
-            // Note: we can't easily extract IVF's top-5 indices without
-            // adding API. We assert on score equality which is what users see.
+            if (Math.abs(truthScore - v7Score) < 1e-6) scoreEqual++;
         }
 
         double scoreRate = scoreEqual / (double) QUERIES;
-        System.out.printf("[ivf] fraud_score equal: %d/%d (%.1f%%) on K=%d clusters, NPROBE=%d%n",
-                scoreEqual, QUERIES, scoreRate * 100, K_CLUSTERS, KnnSearcher.NPROBE);
+        System.out.printf("[v7] fraud_score equal: %d/%d (%.1f%%) — K=%d clusters, bbox-repair%n",
+                scoreEqual, QUERIES, scoreRate * 100, K_CLUSTERS);
 
-        assertTrue(scoreRate >= 0.80,
-                "IVF recall too low on synthetic uniform data: " + scoreRate
-                        + " — increase NPROBE or check k-means convergence");
+        // Bbox repair is exact — should be >= 99% even on uniform synthetic data.
+        assertTrue(scoreRate >= 0.99,
+                "v7 int16 + IVF + bbox-repair should match float32 brute force, got "
+                        + scoreRate + " agreement");
     }
 
     /* ---- helpers ---- */

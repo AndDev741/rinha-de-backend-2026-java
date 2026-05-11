@@ -14,7 +14,9 @@
       - No Spring. No Helidon. No Jackson. Nothing.
       - The HTTP server comes from the JDK itself (com.sun.net.httpserver).
       - The JSON parser is hand-rolled, written for this challenge's fixed schema.
-      - jdk.incubator.vector is enabled for step 2 (SIMD via Vector API).
+      - v7 drops the Vector API entirely: scalar manual unrolled loops on
+        int16 data win for our problem shape (14 dims, lots of early-exit
+        opportunity). See v6's regression for why.
     -->
 
     <properties>
@@ -38,19 +40,10 @@
             <plugin>
                 <artifactId>maven-compiler-plugin</artifactId>
                 <version>3.13.0</version>
-                <configuration>
-                    <!-- Vector API is still incubator; needs the flag to compile. -->
-                    <compilerArgs>
-                        <arg>--add-modules=jdk.incubator.vector</arg>
-                    </compilerArgs>
-                </configuration>
             </plugin>
             <plugin>
                 <artifactId>maven-surefire-plugin</artifactId>
                 <version>3.2.5</version>
-                <configuration>
-                    <argLine>--add-modules=jdk.incubator.vector</argLine>
-                </configuration>
             </plugin>
             <!-- Packages a single executable JAR (light uberjar, no runtime deps). -->
             <plugin>
