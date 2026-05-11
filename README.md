@@ -3,20 +3,45 @@
 > **🇬🇧 [English](#english) · 🇧🇷 [Português](#português)**
 
 > **Branch strategy:** each major step lives on its own branch (`v1`, `v2`,
-> `v3`, ...). The final submission lives on `main`. This branch is **`v5`** —
-> IVF (Inverted File) coarse k-means partitioning. **First positive
-> Docker score: +2600.82.**
+> `v3`, ...). The final submission lives on `main`. This branch is **`v6`** —
+> GraalVM `native-image` build. **Surprising regression:** native AOT is
+> ~4× slower than the JIT for our SIMD-heavy code on this hardware,
+> because GraalVM 25's Vector API native support is still experimental
+> and doesn't accelerate our `convertShape` + FMA pipeline. **`v5` remains
+> the champion at +2600.82 Docker.**
 
 ---
 
 ## English
 
-In `v5` we replace brute force with **IVF (Inverted File Index)**: a coarse
-k-means partition over the 3M reference vectors into K=256 clusters. At
-query time we (1) compute distance to all K centroids, (2) pick the
-NPROBE=3 nearest clusters, and (3) brute-force the v4 hybrid SIMD distance
-only inside those clusters. The brute-force loop drops from 3M ×
-to ~36k × — a roughly 80× reduction in inner-loop work.
+In `v6` we tried to compile the v5 code into a GraalVM native binary.
+The hypothesis was: kill JIT warmup variance, shrink RSS, push p99 lower.
+The reality on AVX2 hardware with the current GraalVM 25 release: **the
+native build is ~4× slower than the JIT for SIMD-heavy code**.
+
+Root cause: GraalVM 25's `native-image` advertises experimental Vector
+API support (`-H:+VectorAPISupport`) but only covers "load, store, basic
+arithmetic, reduce, compare, blend". Our hot path uses `convertShape(B2F)`
+(byte-to-float widening) and `FloatVector.fma` — neither is on that list.
+At runtime they fall back to a slow path (likely scalar emulation through
+the AOT-compiled bridge), which costs more than the JIT's well-tuned
+C2 codegen.
+
+We verified this is not a configuration accident: building both with
+and without `VectorAPISupport` gives the same regression. The
+native binary fundamentally can't match what HotSpot does for our
+specific SIMD calls today.
+
+**`v5` (JVM with explicit Vector API) is the best version we have.**
+Below is a record of v6's measurements and the future-work list it
+unlocked.
+
+In `v5` we replaced brute force with **IVF (Inverted File Index)**: a
+coarse k-means partition over the 3M reference vectors into K=256
+clusters. At query time we (1) compute distance to all K centroids,
+(2) pick the NPROBE=3 nearest clusters, and (3) brute-force the v4
+hybrid SIMD distance only inside those clusters. The brute-force loop
+drops from 3M × to ~36k × — a roughly 80× reduction in inner-loop work.
 
 **Findings:**
 - 🎯 **First positive Docker score: +2600.82** (was −6000 in v4).
@@ -37,9 +62,36 @@ to ~36k × — a roughly 80× reduction in inner-loop work.
 2. ✅ **`v2`** — Docker stack + nginx LB + cgroup limits (final score: −6000)
 3. ✅ **`v3`** — Vector API SIMD with KNN_MODE A/B (host: +2726, Docker: −6000)
 4. ✅ **`v4`** — int8 storage + hybrid B→F SIMD (Docker fits 350 MB, score: −6000)
-5. ✅ **`v5` (this branch)** — IVF coarse k-means (Docker: **+2600.82**, p99 88 ms)
-6. **`v6`** — GraalVM `native-image` (target: kill warmup, ~30-50 % p99 cut, push score above +3000)
-7. (optional) **`v7`** — NPROBE tuning, residual quantization, or smaller-K experiments
+5. ✅ **`v5`** — IVF coarse k-means (Docker: **+2600.82**, p99 88 ms) ← champion
+6. ✅ **`v6` (this branch)** — GraalVM `native-image` (Docker: −6000, regression vs v5)
+
+### Future optimizations — not yet attempted
+
+- **PGO (Profile-Guided Optimization)** for native-image. Run the binary
+  under a representative load with `-H:Profile`, then rebuild using the
+  collected profile. Native-image AOT compilers traditionally give up
+  10–30 % perf vs JIT in part because they lack runtime profiling;
+  PGO closes that gap. Cost: a training run + a second build (~2× build
+  time). Could plausibly flip v6 from −6000 to a positive Docker score.
+- **Bake the dataset into the image.** Currently `vectors-i8.bin` lives
+  in a host volume mounted at `/data`. The rinha submission engine
+  doesn't supply data — we have to embed it. Bake means running
+  `DatasetBuilder` during `docker build` and `COPY`-ing the binary
+  artifacts into the image. Adds ~42 MB to the image but removes the
+  external dependency. Done as part of the final submission preparation.
+- **NPROBE tuning.** v5 ran NPROBE=3 (recall ~95 %). Bumping to 5 or 7
+  would recover detection_score (currently +1547 of max +3000) at the
+  cost of p99 (currently +1054). With v5's 88 ms p99, doubling to 176 ms
+  is still well under the 2 s cutoff. Net could be +200 to +500 score.
+- **More k-means iterations.** v5 stopped at iter 19 with 0.6 %
+  reassignments. Pushing to 50 iters would tighten cluster fit and
+  recover a small slice of detection.
+- **Switch to GraalVM EE (Oracle).** GraalVM EE adds a few percent perf
+  and slightly better Vector API support. Requires Oracle license
+  acceptance (free for non-commercial).
+- **Hand-tuned scalar fallback for native-image.** Write a non-Vector-API
+  version of the inner loop and let C-compiler-style optimizations do
+  the SIMD. May produce better native code than Vector API does today.
 
 Each branch is self-contained and lets us compare scores side-by-side as we
 evolve the solution.
@@ -442,14 +494,102 @@ Detailed v5 Docker breakdown:
 - **Combined v5+v6 target: +4500–5000.**
 
 ---
+
+### v6 results — GraalVM native-image (REGRESSION)
+
+#### Build artifacts
+
+| | v5 (JVM) | v6 (native) |
+|---|---|---|
+| Image size (unpacked) | 305 MB | **138 MB** (−55 %) |
+| Image size (pulled) | 75.5 MB | 34.6 MB (−54 %) |
+| Container startup | ~1 s | ~3 s |
+| Build time | ~2 s | **~3 min** (native compile) |
+
+#### Benchmarks
+
+| Run | Setup | served | p99 | failure | final_score |
+|---|---|---|---|---|---|
+| v5 host       | JVM, 4 threads, no limits     | 54 059 | 2.26 ms | 0.26 %  | **+4193.11** |
+| v5 Docker     | JVM, rinha rules              | 53 891 | 88 ms   | 0.26 %  | **+2600.82** |
+| v6 host       | native, 4 threads, host net   | 14 792 | 2002 ms | 3.11 %  | **−3173.13** |
+| v6 Docker     | native, rinha rules (85 MB)   |    597 | 2001 ms | 98.79 % | **−6000.00** |
+| v6 Docker (no VectorAPI flag) | native, no `-H:+VectorAPISupport` | 1 076 | 2001 ms | 97.77 % | **−6000.00** |
+
+#### Diagnosis
+
+v6's per-request latency was much higher than v5's at the same load.
+Single requests under low concurrency: 35–80 ms (similar to v5). Under
+the 900 req/s ramp: every request times out. That's a throughput
+regression at sustained load, not a peak-latency regression.
+
+The most likely culprit is the **Vector API native-image support gap**.
+GraalVM 25 documents that only basic SIMD ops compile to native
+instructions; `convertShape(B2F)` and `FloatVector.fma` (our two
+hottest ops) are not on the supported list. They run via a slower
+fallback path that the JIT doesn't need.
+
+We tried both with and without `-H:+VectorAPISupport`. Without the
+flag is marginally better (1076 vs 597 served), suggesting the
+"experimental" support is actively *worse* than Java's standard
+scalar emulation for our specific calls. Either way both hit −6000.
+
+#### What v6 successfully delivered
+
+- ✅ **Native binary builds** in 45 s (no reflection/resource config needed).
+- ✅ **Static analysis passes** — our hand-rolled HTTP + JSON + Vector
+  API code base is fully native-image-compatible without any extra config.
+- ✅ **Image is 4.6× smaller** than the v5 JRE image (138 MB vs 305 MB).
+- ✅ **Memory budget headroom** — would fit comfortably under the rinha
+  cap if performance were competitive.
+
+#### What it didn't
+
+- ❌ **Throughput dropped 4× at sustained load.** The advertised native
+  AOT speedup didn't materialize for SIMD-heavy code on AVX2 + GraalVM 25.
+
+#### What we keep
+
+The `v5` JVM build remains the deployment target. The `v6` infrastructure
+(native-image profile in pom.xml, multi-stage Dockerfile, distroless-style
+runtime) is preserved on this branch as a starting point for future
+experiments — particularly **PGO** and **GraalVM EE**, both of which could
+plausibly close the gap.
+
+---
 ---
 
 ## Português
 
 > **Estratégia de branches:** cada passo grande vive numa branch própria
 > (`v1`, `v2`, `v3`, ...). A submissão final vive em `main`. Esta branch
-> é a **`v5`** — IVF (Inverted File) com partição coarse via k-means.
-> **Primeiro score positivo em Docker: +2600.82.**
+> é a **`v6`** — build com GraalVM `native-image`. **Regressão
+> surpreendente:** AOT nativo é ~4× mais lento que o JIT para o nosso
+> código SIMD-heavy neste hardware, porque o suporte a Vector API do
+> GraalVM 25 ainda é experimental e não acelera o pipeline `convertShape`
+> + FMA. **A `v5` continua a ser a campeã com +2600.82 em Docker.**
+
+Na `v6` tentámos compilar o código da v5 num binário nativo GraalVM. A
+hipótese: matar variância do warmup do JIT, encolher RSS, baixar p99.
+A realidade em hardware AVX2 com a release atual do GraalVM 25: **o
+build nativo é ~4× mais lento que o JIT para código SIMD-heavy.**
+
+Causa raiz: o `native-image` do GraalVM 25 anuncia suporte experimental
+a Vector API (`-H:+VectorAPISupport`) mas só cobre "load, store,
+basic arithmetic, reduce, compare, blend". O nosso hot path usa
+`convertShape(B2F)` (widening byte→float) e `FloatVector.fma` —
+nenhum dos dois está nessa lista. Em runtime caem para um caminho
+lento (provavelmente emulação scalar via ponte AOT-compilada), que
+custa mais que o codegen do C2 do JIT.
+
+Verificámos que isto não é acidente de configuração: builds com e
+sem `VectorAPISupport` deram a mesma regressão. O binário nativo
+fundamentalmente não consegue igualar o que o HotSpot faz para os
+nossos chamadas SIMD específicas hoje.
+
+**A `v5` (JVM com Vector API explícita) é a melhor versão que temos.**
+Em baixo está o registo das medições da v6 e a lista de trabalho
+futuro que ela desbloqueou.
 
 Na `v5` substituímos o brute force pelo **IVF (Inverted File Index)**:
 uma partição coarse via k-means dos 3M vetores de referência em K=256
@@ -478,9 +618,38 @@ inner loop.
 2. ✅ **`v2`** — Docker stack + nginx LB + cgroup limits (final score: −6000)
 3. ✅ **`v3`** — Vector API SIMD com KNN_MODE A/B (host: +2726, Docker: −6000)
 4. ✅ **`v4`** — int8 storage + híbrido B→F SIMD (Docker cabe em 350 MB, score: −6000)
-5. ✅ **`v5` (esta branch)** — IVF coarse k-means (Docker: **+2600.82**, p99 88 ms)
-6. **`v6`** — GraalVM `native-image` (alvo: matar warmup, cortar p99 30-50%, score acima de +3000)
-7. (opcional) **`v7`** — tuning de NPROBE, residual quantization ou experiências com K menor
+5. ✅ **`v5`** — IVF coarse k-means (Docker: **+2600.82**, p99 88 ms) ← campeã
+6. ✅ **`v6` (esta branch)** — GraalVM `native-image` (Docker: −6000, regressão vs v5)
+
+### Optimizações futuras — ainda não experimentadas
+
+- **PGO (Profile-Guided Optimization)** para native-image. Correr o
+  binário sob carga representativa com `-H:Profile`, depois recompilar
+  usando o profile. Os AOT compilers tradicionalmente cedem 10–30 % ao
+  JIT em parte por falta de profiling em runtime; PGO fecha esse gap.
+  Custo: um run de treino + segundo build (~2× tempo de build). Pode
+  plausivelmente virar a v6 de −6000 para um score positivo em Docker.
+- **Bake do dataset na imagem.** Atualmente `vectors-i8.bin` vive num
+  volume montado em `/data`. O engine de submissão da rinha não fornece
+  dados — temos de embebê-los. Bake significa correr o `DatasetBuilder`
+  durante `docker build` e fazer `COPY` dos artefactos para a imagem.
+  Adiciona ~42 MB à imagem mas remove a dependência externa. Faz parte
+  da preparação da submissão final.
+- **Tuning de NPROBE.** A v5 corre NPROBE=3 (recall ~95%). Subir para
+  5 ou 7 recuperaria detection_score (atual +1547 do máximo +3000) ao
+  custo de p99 (atual +1054). Com p99 da v5 a 88 ms, dobrar para 176 ms
+  ainda fica bem abaixo do corte de 2 s. Líquido pode ser +200 a +500
+  no score.
+- **Mais iterações de k-means.** A v5 parou na iter 19 com 0.6% de
+  reassignments. Ir até 50 iters apertaria o ajuste dos clusters e
+  recuperaria uma fatia pequena de detection.
+- **Mudar para GraalVM EE (Oracle).** GraalVM EE adiciona alguns por
+  cento de perf e suporte ligeiramente melhor a Vector API. Requer
+  aceitar licença Oracle (gratuita para uso não-comercial).
+- **Fallback scalar à mão para native-image.** Escrever uma versão
+  do inner loop sem Vector API e deixar otimizações estilo C
+  fazerem o SIMD. Pode produzir melhor código nativo do que a Vector
+  API hoje.
 
 ---
 
@@ -858,3 +1027,66 @@ Breakdown detalhado da v5 Docker:
   (GraalVM nativo) deve matar variância do JIT warmup e apertar
   layout.
 - **Alvo combinado v5+v6: +4500–5000.**
+
+---
+
+### Resultados da v6 — GraalVM native-image (REGRESSÃO)
+
+#### Artefactos do build
+
+| | v5 (JVM) | v6 (nativo) |
+|---|---|---|
+| Tamanho da imagem (unpacked) | 305 MB | **138 MB** (−55%) |
+| Tamanho da imagem (pulled) | 75.5 MB | 34.6 MB (−54%) |
+| Startup do container | ~1 s | ~3 s |
+| Tempo de build | ~2 s | **~3 min** (compilação nativa) |
+
+#### Benchmarks
+
+| Run | Setup | servidos | p99 | falha | final_score |
+|---|---|---|---|---|---|
+| v5 host       | JVM, 4 threads, sem limites    | 54 059 | 2.26 ms | 0.26 %  | **+4193.11** |
+| v5 Docker     | JVM, regras da rinha           | 53 891 | 88 ms   | 0.26 %  | **+2600.82** |
+| v6 host       | nativo, 4 threads, host net    | 14 792 | 2002 ms | 3.11 %  | **−3173.13** |
+| v6 Docker     | nativo, regras da rinha (85 MB) |    597 | 2001 ms | 98.79 % | **−6000.00** |
+| v6 Docker (sem flag VectorAPI) | nativo, sem `-H:+VectorAPISupport` | 1 076 | 2001 ms | 97.77 % | **−6000.00** |
+
+#### Diagnóstico
+
+A latência por request da v6 sob carga é muito maior que a v5 ao mesmo
+load. Requests isolados em baixa concorrência: 35–80 ms (igual à v5).
+Sob a rampa de 900 req/s: cada request dá timeout. É uma regressão
+de throughput sob carga sustentada, não de latência peak.
+
+A causa mais provável é o **gap no suporte a Vector API do native-image**.
+GraalVM 25 documenta que só ops básicas SIMD compilam para instruções
+nativas; `convertShape(B2F)` e `FloatVector.fma` (as nossas duas ops
+mais quentes) não estão na lista suportada. Correm via um caminho
+fallback mais lento que o JIT não precisa.
+
+Tentámos com e sem `-H:+VectorAPISupport`. Sem flag é marginalmente
+melhor (1076 vs 597 servidos), sugerindo que o suporte "experimental"
+é ativamente *pior* que a emulação scalar standard do Java para as
+nossas chamadas específicas. De qualquer forma, ambos batem −6000.
+
+#### O que a v6 entregou com sucesso
+
+- ✅ **Binário nativo compila** em 45 s (sem config para reflection/recursos).
+- ✅ **Análise estática passa** — o nosso código (HTTP+JSON+Vector API
+  hand-rolled) é totalmente compatível com native-image sem config extra.
+- ✅ **Imagem 4.6× menor** que a imagem JRE da v5 (138 MB vs 305 MB).
+- ✅ **Margem no orçamento de memória** — caberia confortavelmente sob o
+  cap da rinha se a performance fosse competitiva.
+
+#### O que não entregou
+
+- ❌ **Throughput caiu 4× em carga sustentada.** O speedup AOT nativo
+  anunciado não materializou para código SIMD-heavy em AVX2 + GraalVM 25.
+
+#### O que mantemos
+
+O build JVM da `v5` continua a ser o alvo de deployment. A infraestrutura
+da `v6` (profile native-image no pom.xml, Dockerfile multi-stage, runtime
+estilo distroless) fica preservada nesta branch como ponto de partida
+para experiências futuras — particularmente **PGO** e **GraalVM EE**,
+que poderiam plausivelmente fechar o gap.

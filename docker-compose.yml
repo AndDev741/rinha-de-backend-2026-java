@@ -1,27 +1,23 @@
 # ─────────────────────────────────────────────────────────────
-# rinha-fraud — local stack
+# rinha-fraud — local stack (v6: GraalVM native binary)
 #
 # Layout:
 #   client → nginx (lb) → round-robin → api-1 + api-2
 #
-# Resource budget (rinha rules: 1 CPU + 350 MB total, sum across services):
-#   nginx     : 0.10 CPU /  30 MB
-#   api-1     : 0.45 CPU / 160 MB
-#   api-2     : 0.45 CPU / 160 MB
-#   ──────────────────────────────
-#   TOTAL     : 1.00 CPU / 350 MB
+# Resource budget (rinha rules: 1 CPU + 350 MB total):
+#   nginx  : 0.10 CPU /  30 MB
+#   api-1  : 0.45 CPU /  85 MB
+#   api-2  : 0.45 CPU /  85 MB
+#   ─────────────────────────────
+#   TOTAL  : 1.00 CPU / 200 MB     ← ~150 MB UNDER the rinha 350 MB ceiling
 #
-# Honest caveat for v2:
-#   Our v1 code copies the 161 MB dataset into a heap float[]. That alone
-#   exceeds 160 MB per instance (with JVM overhead the JVM needs ~240 MB).
-#   So with the strict 160 MB limit set below, both api containers will OOM
-#   at startup. THAT IS THE LESSON of v2 — it proves why v3/v4 (memory
-#   reduction via mmap-only loading or int8 quantization) is unavoidable.
-#
-#   For a working local run while we still have v1 search code, swap the
-#   `mem_limit` lines to 256m on api-1 and api-2. Total goes to 542 MB,
-#   over budget, but lets us measure CPU performance under the realistic
-#   1-vCPU constraint. See the README for both modes.
+# Memory profile per api-* container (native binary):
+#   - dataset byte[]    : ~42 MB  (heap-resident int8 IVF)
+#   - centroids + offs  : ~15 KB  (negligible)
+#   - native runtime    : ~10-15 MB  (vs ~50-80 MB JVM overhead in v5)
+#   - working memory    : ~10 MB
+#   - container OS      : ~5 MB
+#   total                ≈ 70-75 MB → 85 MB cgroup limit gives headroom
 # ─────────────────────────────────────────────────────────────
 
 services:
@@ -29,33 +25,23 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: rinha-fraud:v2
+    image: rinha-fraud:v6
     networks:
       - rinha-net
     volumes:
-      # Both API containers see the same dataset via the same inode.
-      # The Linux kernel shares the page cache between them, so the
-      # 161 MB of vectors.bin is paid only once at OS level — even if
-      # cgroup accounting may double-count per container.
       - ./data:/data:ro
     environment:
       PORT: 9999
       DATA_DIR: /data
       THREADS: 2
-      # v4: int8 dataset is 42 MB (vs 168 MB float32 in v1-v3), so we can
-      # finally fit inside the rinha 350 MB-total budget.
-      # Heap breakdown per instance:
-      #   - dataset byte[]    : ~42 MB
-      #   - JVM overhead      : ~30 MB (metaspace + code cache + threads)
-      #   - working heap      : ~30 MB
-      #   total                ≈ 100-110 MB → -Xmx128m fits with margin
-      # Container limit 160 MB leaves some room for the kernel + GC bursts.
-      JAVA_OPTS: "-Xmx128m -XX:+UseSerialGC --add-modules=jdk.incubator.vector"
+      # No JAVA_OPTS — there's no JVM. The native binary handles its own
+      # GC and memory directly. The size is determined at native-image
+      # compile time (--gc=serial in pom.xml).
     deploy:
       resources:
         limits:
           cpus: "0.45"
-          memory: "160M"
+          memory: "85M"
 
   api-2:
     <<: *api
@@ -68,8 +54,6 @@ services:
     networks:
       - rinha-net
     ports:
-      # Only the LB is reachable from the host. The api-* services are
-      # only addressable inside the rinha-net bridge.
       - "9999:9999"
     volumes:
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
@@ -81,5 +65,4 @@ services:
 
 networks:
   rinha-net:
-    # Bridge mode is required by the rinha rules (no host, no privileged).
     driver: bridge

@@ -66,4 +66,59 @@
             </plugin>
         </plugins>
     </build>
+
+    <profiles>
+        <!--
+          v6: GraalVM native-image profile.
+          Activate with: mvn -Pnative -DskipTests package
+          Output: target/rinha-fraud (a static binary).
+
+          Flags below (XML comments cannot contain consecutive dashes, so the
+          long form "no-fallback" stands in for the literal command-line flag):
+
+          no-fallback        hard-fail if native-image cannot compile, instead
+                             of producing a JVM-bundled fallback.
+          add-modules=jdk.incubator.vector
+                             same module flag the JIT build needs at compile time.
+          UnlockExperimentalVMOptions + VectorAPISupport
+                             experimental but functional in GraalVM 25; enables
+                             native code generation for jdk.incubator.vector
+                             ops. Without it, Vector API falls back to scalar.
+          O3                 maximum optimization (longer build, faster binary).
+          gc=serial          smallest and most predictable GC for our workload
+                             (single-threaded handlers, small heap).
+        -->
+        <profile>
+            <id>native</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.graalvm.buildtools</groupId>
+                        <artifactId>native-maven-plugin</artifactId>
+                        <version>0.10.3</version>
+                        <extensions>true</extensions>
+                        <executions>
+                            <execution>
+                                <id>build-native</id>
+                                <goals>
+                                    <goal>compile-no-fork</goal>
+                                </goals>
+                                <phase>package</phase>
+                            </execution>
+                        </executions>
+                        <configuration>
+                            <imageName>rinha-fraud</imageName>
+                            <mainClass>${main.class}</mainClass>
+                            <buildArgs>
+                                <buildArg>--no-fallback</buildArg>
+                                <buildArg>--add-modules=jdk.incubator.vector</buildArg>
+                                <buildArg>-O3</buildArg>
+                                <buildArg>--gc=serial</buildArg>
+                            </buildArgs>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
 </project>
