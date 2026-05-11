@@ -27,8 +27,8 @@ services:
     image: rinha-fraud:v7
     networks:
       - rinha-net
-    volumes:
-      - ./data:/data:ro
+    # No volume mount: the int16 IVF dataset is baked into the image
+    # during `docker build` (see Dockerfile stage 1).
     environment:
       PORT: 9999
       DATA_DIR: /data
