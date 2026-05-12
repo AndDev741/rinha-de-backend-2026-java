@@ -19,13 +19,12 @@
 
 services:
   api-1: &api
-    image: anddev741/rinha-fraud-java:v7
+    image: anddev741/rinha-fraud-java:v7.1
     networks:
       - rinha-net
     environment:
       PORT: 9999
       DATA_DIR: /data
-      THREADS: 2
       JAVA_OPTS: "-Xmx128m -XX:+UseSerialGC"
     deploy:
       resources:
