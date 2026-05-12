@@ -32,9 +32,11 @@ services:
     environment:
       PORT: 9999
       DATA_DIR: /data
-      # v7.1: int16 dataset is 84 MB heap. -Xmx128m gives ~44 MB of working
-      # heap headroom beyond the data, comfortably absorbing GC churn.
-      # Virtual threads handle concurrency; no THREADS env any more.
+      # v7.2: 4 platform threads + 4096 accept backlog handle the rinha k6
+      # ramp (peaks ~900 RPS). Smaller pools are safer on the rinha runner's
+      # 0.45 CPU than virtual threads, which fanned out too eagerly in v7.1.
+      WORKERS: 4
+      # 84 MB short[] dataset + ~44 MB working heap fits well inside 165 MB.
       JAVA_OPTS: "-Xmx128m -XX:+UseSerialGC"
     deploy:
       resources:
