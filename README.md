@@ -18,18 +18,31 @@ No Spring, no Jackson, no Helidon. JDK 25, the built-in `HttpServer`, a
 hand-rolled JSON parser, and a from-scratch IVF k-NN with bounding-box
 pruning. ~1500 lines of Java total.
 
-### What the implementation gives you
+### Score under rinha rules
+
+| Metric | Value |
+|---|---|
+| Final score | **+4049.51** |
+| p99 latency | 89.23 ms |
+| Failure rate | 0 % |
+| False positives | 0 / 54 060 |
+| False negatives | 0 / 54 060 |
+| Detection score | +3000 (maximum) |
+| p99 score | +1049.51 |
+
+Image: `anddev741/rinha-fraud-java:v7.3` on Docker Hub.
+Submission commit: [`5e68831`](../../tree/submission).
 
 The k-NN is exact: same top-5 as float32 brute force, but with most of the
 dataset never scanned. Under the rinha rules (1 vCPU, 350 MB, 2 instances
-behind nginx) the local run lands at 0 % failures and zero false positives
-or negatives on the official references. The official rinha score will go
-here once the submission is graded.
+behind nginx) every answered request is classified correctly, and no
+requests time out.
 
 This repo is also a learning trail. Each branch (`v1` through `v7`) is a
 working snapshot of one optimization, with measured scores. `v6` is a
 documented regression (GraalVM `native-image` did not pay off for our code).
-The journey is at the bottom of this README.
+The first three rinha submissions also regressed before v7.3 found the
+fix; that story is in the journey section at the bottom of this README.
 
 ---
 
@@ -189,12 +202,12 @@ rinha-de-backend-andre-java/
 
 ---
 
-### How we got here: v1 to v7
+### How we got here: v1 to v7.3
 
 Each branch is a self-contained snapshot. The Docker score column is the
 final number under rinha rules (1 vCPU + 350 MB).
 
-| Branch | What changed | Docker score | Notes |
+| Branch | What changed | Score | Notes |
 |---|---|---|---|
 | `v1` | Scalar baseline, JDK HttpServer, brute-force k-NN | +2742 (host) | No Docker yet |
 | `v2` | Docker stack + nginx + cgroup limits | −6000 | First reality check |
@@ -202,9 +215,12 @@ final number under rinha rules (1 vCPU + 350 MB).
 | `v4` | int8 quantization, 168 MB → 42 MB | −6000 | Memory budget met |
 | `v5` | IVF k-means, NPROBE=3 approximation | **+2600** | First positive score |
 | `v6` | GraalVM `native-image` attempt | −6000 | Regression. Documented. |
-| `v7` | int16 + bbox-repair + scalar manual loop | _pending_ | Current main, submission in flight |
+| `v7` | int16 + bbox-repair, 2 workers, random warmup | −3254 (rinha) | First exact k-NN under budget |
+| `v7.1` | Virtual threads | −6000 (rinha) | More concurrency hurt |
+| `v7.2` | 4 workers + realistic warmup | −6000 (rinha) | More workers hurt |
+| `v7.3` | 2 workers + realistic warmup | **+4049.51 (rinha)** | The combination unlocked it |
 
-Two stories from this list are worth telling.
+Three stories from this list are worth telling.
 
 **v2 was the wake-up call.** The host JVM did +2742 on my laptop. The
 Docker stack with rinha-spec resource limits did −6000. The host
@@ -228,6 +244,27 @@ it regressed and got dropped. The lesson: localhost TCP under modern Linux
 is faster than I expected, and replacing nginx + JDK `HttpServer` with my
 own UDS HTTP server cost more in allocations and VT scheduling than UDS
 saved in syscalls.
+
+**v7 → v7.3 was the JIT cliff.** Locally v7 looked great. The official
+rinha run hit 45.9 % errors with p99 pinned against the 2001 ms k6
+timeout. Two more configurations made it worse before the right
+combination clicked.
+
+The bug was structural. v7's warmup ran 1000 random-vector searches at
+startup, but random queries bbox-prune to nothing and never exercise the
+cluster-scan + bbox-repair hot path. When real fraud queries arrived they
+hit code C2 hadn't compiled yet, ran 10-100× slower, the queue overflowed
+past the 2001 ms cap, and 23 000 requests timed out. The k-NN was correct
+on every request it answered (0 false positives, 0 false negatives across
+all 4 runs); throughput was the bottleneck the whole time.
+
+The fix is two things together. **Realistic warmup** samples 2000 dataset
+vectors with light noise as queries, forcing C2 to compile the same
+bytecode real traffic will hit, before `/ready` returns 200. **WORKERS=2**
+matches the rinha runner's CPU budget: with the 0.45 CPU per container,
+more workers just split that budget across more contenders and raise
+per-request latency. v7.1 (virtual threads) and v7.2 (4 workers) both
+regressed for exactly that reason. v7.3 lands at p99 89 ms and 0 % errors.
 
 For each branch's detailed numbers, the commit message has them.
 
@@ -270,18 +307,32 @@ Sem Spring, sem Jackson, sem Helidon. JDK 25, o `HttpServer` que vem na
 JDK, um parser JSON escrito à mão, e um k-NN IVF com poda por bounding box
 escrito do zero. ~1500 linhas de Java no total.
 
-### O que a implementação entrega
+### Score nas regras da rinha
+
+| Métrica | Valor |
+|---|---|
+| Score final | **+4049.51** |
+| p99 | 89.23 ms |
+| Taxa de falha | 0 % |
+| Falsos positivos | 0 / 54 060 |
+| Falsos negativos | 0 / 54 060 |
+| Detection score | +3000 (máximo) |
+| p99 score | +1049.51 |
+
+Imagem: `anddev741/rinha-fraud-java:v7.3` no Docker Hub.
+Commit da submissão: [`5e68831`](../../tree/submission).
 
 O k-NN é exato: mesmo top-5 que brute force em float32, mas com a maioria
 do dataset nunca varrido. Sob as regras da rinha (1 vCPU, 350 MB, 2
-instâncias atrás do nginx) a corrida local fica em 0 % de falhas e zero
-falsos positivos ou negativos no references oficial. O score oficial da
-rinha vai entrar aqui quando a submissão for avaliada.
+instâncias atrás do nginx) cada pedido respondido é classificado
+correctamente, e nenhum dá timeout.
 
-Este repo também é um registo de aprendizagem. Cada branch (`v1` a `v7`) é
-um snapshot funcional de uma optimização, com scores medidos. `v6` é uma
-regressão documentada (o `native-image` do GraalVM não compensou). A
-viagem está no fim deste README.
+Este repo também é um registo de aprendizagem. Cada branch (`v1` a `v7`)
+é um snapshot funcional de uma optimização, com scores medidos. `v6` é
+uma regressão documentada (o `native-image` do GraalVM não compensou).
+As três primeiras submissões à rinha também regrediram antes da v7.3
+encontrar a solução; essa história está na secção da jornada no fim
+deste README.
 
 ---
 
@@ -442,12 +493,12 @@ rinha-de-backend-andre-java/
 
 ---
 
-### A jornada: v1 a v7
+### A jornada: v1 a v7.3
 
-Cada branch é um snapshot independente. A coluna do Docker score é o
-número final sob as regras da rinha (1 vCPU + 350 MB).
+Cada branch é um snapshot independente. A coluna Score é o número final
+sob as regras da rinha (1 vCPU + 350 MB).
 
-| Branch | O que mudou | Docker score | Notas |
+| Branch | O que mudou | Score | Notas |
 |---|---|---|---|
 | `v1` | Baseline scalar, JDK HttpServer, brute-force k-NN | +2742 (host) | Ainda sem Docker |
 | `v2` | Stack Docker + nginx + limites cgroup | −6000 | Primeira reality check |
@@ -455,9 +506,12 @@ número final sob as regras da rinha (1 vCPU + 350 MB).
 | `v4` | Quantização int8, 168 MB → 42 MB | −6000 | Orçamento de memória cumprido |
 | `v5` | IVF k-means, aproximação NPROBE=3 | **+2600** | Primeiro score positivo |
 | `v6` | Tentativa GraalVM `native-image` | −6000 | Regressão. Documentada. |
-| `v7` | int16 + bbox-repair + loop scalar manual | _pendente_ | Main actual, submissão em curso |
+| `v7` | int16 + bbox-repair, 2 workers, warmup aleatório | −3254 (rinha) | Primeiro k-NN exato dentro do orçamento |
+| `v7.1` | Virtual threads | −6000 (rinha) | Mais concorrência piorou |
+| `v7.2` | 4 workers + warmup realista | −6000 (rinha) | Mais workers piorou |
+| `v7.3` | 2 workers + warmup realista | **+4049.51 (rinha)** | A combinação desbloqueou |
 
-Duas histórias desta lista vale a pena contar.
+Três histórias desta lista vale a pena contar.
 
 **A v2 foi o despertador.** A JVM do host fez +2742 no meu laptop. O stack
 Docker com os limites de recursos da rinha fez −6000. As medições no host
@@ -481,6 +535,29 @@ regrediu e foi abandonada. A lição: o TCP em loopback no Linux moderno é
 mais rápido do que eu esperava, e substituir nginx + `HttpServer` da JDK
 por um servidor HTTP UDS escrito por mim custou mais em alocações e
 scheduling de virtual threads do que o UDS poupou em syscalls.
+
+**A v7 → v7.3 foi o JIT cliff.** Localmente a v7 parecia óptima. A
+corrida oficial da rinha deu 45.9 % de erros com p99 colado ao timeout
+de 2001 ms do k6. Duas configurações seguintes pioraram antes da
+combinação certa.
+
+O bug era estrutural. O warmup da v7 corria 1000 buscas com vetores
+aleatórios ao arranque, mas queries aleatórias bbox-prune para nada e
+nunca exercitam o hot path de cluster-scan + bbox-repair. Quando as
+queries reais de fraude chegaram, bateram em bytecode que o C2 ainda
+não tinha compilado, correram 10-100× mais lento, a fila ultrapassou
+os 2001 ms e 23 000 pedidos deram timeout. O k-NN estava correcto em
+cada pedido que respondeu (0 falsos positivos, 0 falsos negativos nas
+4 corridas); o gargalo foi sempre throughput.
+
+A correcção são duas coisas em conjunto. **Warmup realista** sampleia
+2000 vetores do dataset com ruído ligeiro como queries, forçando o C2
+a compilar o mesmo bytecode que o tráfego real vai bater, antes do
+`/ready` responder 200. **WORKERS=2** alinha com o orçamento de CPU do
+runner da rinha: com 0.45 CPU por container, mais workers só dividem
+esse orçamento por mais concorrentes e sobem a latência por pedido.
+A v7.1 (virtual threads) e a v7.2 (4 workers) regrediram exactamente
+por isso. A v7.3 fecha em p99 89 ms e 0 % de erros.
 
 Para os números detalhados de cada branch, a mensagem de commit tem-nos
 todos.
