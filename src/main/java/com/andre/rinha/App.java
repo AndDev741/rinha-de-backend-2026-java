@@ -18,7 +18,6 @@ import java.util.concurrent.Executors;
  *   PORT      — HTTP port (default 9999, as required by the challenge)
  *   DATA_DIR  — directory with vectors-i16.bin, centroids-i16.bin, bbox.bin,
  *               cluster_offsets.bin, labels.bin (default ./data)
- *   THREADS   — HttpServer thread pool size (default = number of CPUs)
  *
  * Initialization order:
  *   1. Load the int16 IVF dataset (~84 MB heap).
@@ -30,7 +29,6 @@ public final class App {
     public static void main(String[] args) throws Exception {
         int port = envInt("PORT", 9999);
         Path dataDir = Path.of(env("DATA_DIR", "./data"));
-        int threads = envInt("THREADS", Runtime.getRuntime().availableProcessors());
 
         System.out.println("[app] search: " + KnnSearcher.simdInfo());
 
@@ -44,15 +42,20 @@ public final class App {
 
         warmup(dataset);
 
-        HttpServer server = HttpServer.create(new InetSocketAddress(port), 0);
+        // Backlog of 1024 keeps short bursts from hitting the OS accept queue
+        // limit. Anything past that returns RST and looks like 502 at nginx.
+        HttpServer server = HttpServer.create(new InetSocketAddress(port), 1024);
         server.createContext("/ready", new ReadyHandler());
         server.createContext("/fraud-score", new FraudHandler(dataset));
-        // Fixed pool. For 1 vCPU, 2-4 threads is enough — more than that just
-        // generates context-switch overhead with no real gain.
-        server.setExecutor(Executors.newFixedThreadPool(threads));
+        // Virtual threads (JDK 21+): each request is its own VT, which gets
+        // unmounted while it waits on the socket. We don't need to size a
+        // pool against the cgroup CPU limit — the JVM only schedules the
+        // ones actively computing the k-NN. This is the fix for the v7
+        // rinha submission, which hit 45.9 % errors with a fixed 2-thread pool.
+        server.setExecutor(Executors.newVirtualThreadPerTaskExecutor());
         server.start();
 
-        System.out.printf("[app] listening on :%d with %d threads%n", port, threads);
+        System.out.printf("[app] listening on :%d with virtual threads%n", port);
     }
 
     /**

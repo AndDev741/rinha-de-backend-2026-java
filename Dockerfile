@@ -48,7 +48,6 @@ COPY --from=build /app/data /data
 
 ENV PORT=9999 \
     DATA_DIR=/data \
-    THREADS=2 \
     JAVA_OPTS="-Xmx128m -XX:+UseSerialGC"
 
 EXPOSE 9999

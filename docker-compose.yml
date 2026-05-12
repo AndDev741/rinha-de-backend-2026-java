@@ -32,9 +32,9 @@ services:
     environment:
       PORT: 9999
       DATA_DIR: /data
-      THREADS: 2
-      # v7: int16 dataset is 84 MB heap. -Xmx128m gives ~44 MB of working
+      # v7.1: int16 dataset is 84 MB heap. -Xmx128m gives ~44 MB of working
       # heap headroom beyond the data, comfortably absorbing GC churn.
+      # Virtual threads handle concurrency; no THREADS env any more.
       JAVA_OPTS: "-Xmx128m -XX:+UseSerialGC"
     deploy:
       resources:
