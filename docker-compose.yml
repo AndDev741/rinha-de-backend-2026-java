@@ -19,7 +19,7 @@
 
 services:
   api-1: &api
-    image: anddev741/rinha-fraud-java:v7.2
+    image: anddev741/rinha-fraud-java:v7.3
     networks:
       - rinha-net
     environment:
