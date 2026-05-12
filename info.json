@@ -1,0 +1,10 @@
+{
+  "participants": ["André Luiz Gonçalves"],
+  "social": [
+    "https://github.com/AndDev741",
+    "https://www.linkedin.com/in/andr%C3%A9-luiz-b9915b275/"
+  ],
+  "source-code-repo": "https://github.com/AndDev741/rinha-de-backend-2026-java",
+  "stack": ["java", "jvm", "nginx"],
+  "open_to_work": false
+}
