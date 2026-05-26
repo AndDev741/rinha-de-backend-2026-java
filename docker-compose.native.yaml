@@ -1,0 +1,41 @@
+services:
+  api-1: &api
+    build:
+      context: .
+      dockerfile: Dockerfile.native
+    image: rinha-fraud:v8-native-baseline
+    networks:
+      - rinha-net
+    environment:
+      PORT: 9999
+      DATA_DIR: /data
+      WORKERS: 2
+    deploy:
+      resources:
+        limits:
+          cpus: "0.45"
+          memory: "165M"
+
+  api-2:
+    <<: *api
+
+  lb:
+    image: nginx:1.27-alpine
+    depends_on:
+      - api-1
+      - api-2
+    networks:
+      - rinha-net
+    ports:
+      - "9999:9999"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    deploy:
+      resources:
+        limits:
+          cpus: "0.10"
+          memory: "20M"
+
+networks:
+  rinha-net:
+    driver: bridge
