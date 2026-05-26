@@ -9,21 +9,45 @@
     <version>0.1.0</version>
     <packaging>jar</packaging>
 
-    <!--
-      Learning notes:
-      - No Spring. No Helidon. No Jackson. Nothing.
-      - The HTTP server comes from the JDK itself (com.sun.net.httpserver).
-      - The JSON parser is hand-rolled, written for this challenge's fixed schema.
-      - v7 drops the Vector API entirely: scalar manual unrolled loops on
-        int16 data win for our problem shape (14 dims, lots of early-exit
-        opportunity). See v6's regression for why.
-    -->
-
     <properties>
         <maven.compiler.release>25</maven.compiler.release>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <main.class>com.andre.rinha.App</main.class>
     </properties>
+
+    <profiles>
+        <profile>
+            <id>native</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.graalvm.buildtools</groupId>
+                        <artifactId>native-maven-plugin</artifactId>
+                        <version>0.10.3</version>
+                        <extensions>true</extensions>
+                        <executions>
+                            <execution>
+                                <id>build-native</id>
+                                <phase>package</phase>
+                            </execution>
+                        </executions>
+                        <configuration>
+                            <imageName>rinha-fraud</imageName>
+                            <mainClass>${main.class}</mainClass>
+                            <buildArgs>
+                                <buildArg>--no-fallback</buildArg>
+                                <buildArg>-O3</buildArg>
+                                <buildArg>--gc=serial</buildArg>
+                                <buildArg>-march=x86-64-v3</buildArg>
+                                <buildArg>-H:+UnlockExperimentalVMOptions</buildArg>
+                                <buildArg>-H:+ReportExceptionStackTraces</buildArg>
+                            </buildArgs>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
 
     <dependencies>
         <dependency>

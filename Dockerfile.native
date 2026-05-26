@@ -1,0 +1,77 @@
+# syntax=docker/dockerfile:1.7
+
+# ─────────────────────────────────────────────────────────────
+# Stage 1 — build JAR + bake dataset
+#
+# Uses the Maven + Temurin 25 image so we don't depend on a
+# Maven Wrapper in the repo. We skip the `native` profile here:
+# the native-maven-plugin needs a GraalVM JDK at runtime, and
+# this image ships Temurin. The native image is built in
+# Stage 2 against the JAR produced here.
+# ─────────────────────────────────────────────────────────────
+FROM maven:3.9-eclipse-temurin-25-alpine AS jar-build
+
+WORKDIR /app
+
+# Resolve dependencies first so this layer caches as long as
+# pom.xml doesn't change.
+COPY pom.xml .
+RUN mvn -q -B -e dependency:go-offline
+
+COPY src ./src
+RUN mvn -q -B -e -DskipTests package
+
+# Fetch the canonical references file from the rinha repo and
+# materialize the int16/IVF binaries under /app/data.
+ADD https://github.com/zanfranceschi/rinha-de-backend-2026/raw/main/resources/references.json.gz \
+    /app/resources/references.json.gz
+
+RUN java -cp target/rinha-fraud.jar \
+    com.andre.rinha.prep.DatasetBuilder \
+    /app/resources/references.json.gz /app/data
+
+# ─────────────────────────────────────────────────────────────
+# Stage 2 — native-image compilation
+#
+# Args mirror the `native` profile in pom.xml. The two extras
+# (--static, --libc=musl) are runtime-packaging concerns: the
+# binary has to run on alpine (musl) in Stage 3, so we link
+# statically against musl here instead of glibc.
+# ─────────────────────────────────────────────────────────────
+FROM ghcr.io/graalvm/native-image-community:25-muslib AS native-build
+
+WORKDIR /app
+
+COPY --from=jar-build /app/target/rinha-fraud.jar app.jar
+
+RUN native-image \
+      -jar app.jar \
+      -o rinha-fraud \
+      --no-fallback \
+      -O3 \
+      --gc=serial \
+      -march=x86-64-v3 \
+      --static --libc=musl \
+      -H:+UnlockExperimentalVMOptions \
+      -H:+ReportExceptionStackTraces
+
+# ─────────────────────────────────────────────────────────────
+# Stage 3 — minimal runtime
+#
+# Static musl binary + pre-baked /data. No JVM, no libc beyond
+# what's already linked in.
+# ─────────────────────────────────────────────────────────────
+FROM alpine:3.20
+
+WORKDIR /app
+
+COPY --from=native-build /app/rinha-fraud /app/app
+COPY --from=jar-build    /app/data        /data
+
+ENV PORT=9999 \
+    DATA_DIR=/data \
+    WORKERS=2
+
+EXPOSE 9999
+
+ENTRYPOINT ["/app/app"]
