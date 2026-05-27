@@ -1,7 +1,5 @@
 package com.andre.rinha.vector;
 
-import java.util.Arrays;
-
 /**
  * v7 IVF k-NN with bounding-box repair — exact top-5 with aggressive pruning.
  *
@@ -54,22 +52,8 @@ public final class KnnSearcher {
     private long d0, d1, d2, d3, d4;
     private int  pos0, pos1, pos2, pos3, pos4;
 
-    // Per-request: centroid distances packed as (distance << 16) | clusterIdx,
-    // sorted ascending. After sort, packedDist[0] is the nearest cluster.
-    // 16 bits cover up to K=65535. Distance is a sum of 14 int16-squared,
-    // max ~14 × 2^30 = 2^34; <<16 = 2^50 — fits in long, sign bit free.
-    private static final int IDX_BITS = 16;
-    private static final long IDX_MASK = (1L << IDX_BITS) - 1;
-    private final long[] packedDist;
-
     public KnnSearcher(Dataset dataset) {
         this.dataset = dataset;
-        if (dataset.k() > (1 << IDX_BITS)) {
-            throw new IllegalStateException(
-                    "KnnSearcher packed encoding assumes K ≤ " + (1 << IDX_BITS)
-                            + ", got " + dataset.k());
-        }
-        this.packedDist = new long[dataset.k()];
     }
 
     public static String simdInfo() {
@@ -81,31 +65,32 @@ public final class KnnSearcher {
         // 1. Quantize the query.
         Dataset.quantize(query, qBytes);
 
-        // 2. Compute all centroid distances and sort clusters by proximity.
-        //    Visiting clusters in ascending distance order makes the top-5
-        //    tighten earlier — bbox repair then prunes distant clusters much
-        //    more aggressively in step 4 below.
+        // 2. Find the nearest cluster via centroid distance. Linear scan in
+        //    natural order — the Arrays.sort variant from v8 added ~5µs per
+        //    request without recovering it via better bbox pruning on rinha's
+        //    real workload.
         final short[] centroids = dataset.centroids();
         final int kClusters = dataset.k();
-        final long[] sorted = packedDist;
+        int chosen = 0;
+        long bestD = Long.MAX_VALUE;
         for (int c = 0; c < kClusters; c++) {
             long d = centroidDistance(centroids, c);
-            sorted[c] = (d << IDX_BITS) | (c & IDX_MASK);
+            if (d < bestD) {
+                bestD = d;
+                chosen = c;
+            }
         }
-        Arrays.sort(sorted);
 
-        // 3. Scan the nearest cluster first.
-        int chosen = (int) (sorted[0] & IDX_MASK);
+        // 3. Reset top-5 and scan the chosen cluster.
         resetTop();
         scanCluster(chosen);
 
-        // 4. Bbox repair, in ascending centroid-distance order. Once top-5
-        //    is tight, the bbox lower-bound exceeds d4 for far clusters and
-        //    they auto-skip.
+        // 4. Bbox repair: visit every OTHER cluster and prune via
+        //    lower-bound distance. Empty clusters have a huge bbox.
         final short[] bbMin = dataset.bboxMin();
         final short[] bbMax = dataset.bboxMax();
-        for (int i = 1; i < kClusters; i++) {
-            int c = (int) (sorted[i] & IDX_MASK);
+        for (int c = 0; c < kClusters; c++) {
+            if (c == chosen) continue;
             long worst = d4;
             if (bboxMayBeat(bbMin, bbMax, c, worst)) {
                 scanCluster(c);

@@ -41,6 +41,7 @@ public final class App {
                 dataset.count(), dataset.k(), loadMs,
                 dataset.vectors().length * 2 / (1024.0 * 1024.0));
 
+        preTouch(dataset);
         warmup(dataset);
 
         // Backlog of 4096 absorbs the rinha k6 ramp (peaks ~900 RPS).
@@ -82,6 +83,37 @@ public final class App {
             searcher.fraudScore(q);
         }
         System.out.println("[app] warmup complete");
+    }
+
+    /**
+     * Touch one element per 4 KB page of every dataset array so the OS
+     * commits and pre-faults the pages while we're still on startup,
+     * not on the first request that needs them. Without this, native
+     * Serial-GC heap pages backing the 84 MB vectors[] array fault in
+     * lazily — explaining ~1% of requests hitting 50–100 ms in our
+     * 800 RPS measurements.
+     *
+     * Sums the touched values into a volatile sink so neither the JIT
+     * nor native-image's static analyzer can elide the loop as dead.
+     */
+    private static volatile long BLACKHOLE;
+
+    private static void preTouch(Dataset ds) {
+        long t0 = System.currentTimeMillis();
+        long sum = 0;
+        // short = 2 bytes → 2048 shorts per 4 KB page.
+        final int stride = 2048;
+        short[] v = ds.vectors();
+        for (int i = 0; i < v.length; i += stride) sum += v[i];
+        short[] c = ds.centroids();
+        for (int i = 0; i < c.length; i += stride) sum += c[i];
+        short[] bMin = ds.bboxMin();
+        for (int i = 0; i < bMin.length; i += stride) sum += bMin[i];
+        short[] bMax = ds.bboxMax();
+        for (int i = 0; i < bMax.length; i += stride) sum += bMax[i];
+        BLACKHOLE = sum;
+        System.out.printf("[app] pre-touched in %d ms (sink=%d)%n",
+                System.currentTimeMillis() - t0, sum);
     }
 
     private static String env(String key, String def) {

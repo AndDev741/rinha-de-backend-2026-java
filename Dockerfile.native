@@ -52,8 +52,6 @@ RUN native-image \
       --gc=serial \
       -march=x86-64-v3 \
       --static --libc=musl \
-      -R:MaxHeapSize=120m \
-      -R:MinHeapSize=80m \
       -H:+UnlockExperimentalVMOptions \
       -H:+ReportExceptionStackTraces
 
