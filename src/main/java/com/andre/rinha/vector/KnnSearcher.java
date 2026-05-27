@@ -65,7 +65,10 @@ public final class KnnSearcher {
         // 1. Quantize the query.
         Dataset.quantize(query, qBytes);
 
-        // 2. Find the nearest cluster via centroid distance.
+        // 2. Find the nearest cluster via centroid distance. Linear scan in
+        //    natural order — the Arrays.sort variant from v8 added ~5µs per
+        //    request without recovering it via better bbox pruning on rinha's
+        //    real workload.
         final short[] centroids = dataset.centroids();
         final int kClusters = dataset.k();
         int chosen = 0;
@@ -82,9 +85,8 @@ public final class KnnSearcher {
         resetTop();
         scanCluster(chosen);
 
-        // 4. Bbox repair pass: visit every OTHER cluster and prune via
-        //    lower-bound distance. Empty clusters have a huge bbox (we
-        //    initialized them with MAX/MIN at build time) so they auto-skip.
+        // 4. Bbox repair: visit every OTHER cluster and prune via
+        //    lower-bound distance. Empty clusters have a huge bbox.
         final short[] bbMin = dataset.bboxMin();
         final short[] bbMax = dataset.bboxMax();
         for (int c = 0; c < kClusters; c++) {

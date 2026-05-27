@@ -5,3 +5,9 @@ data/
 .idea/
 .vscode/
 .DS_Store
+
+# instrumentation outputs (local-only)
+test/instrument/
+
+# claude-code session state
+.claude/
