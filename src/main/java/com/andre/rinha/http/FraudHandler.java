@@ -2,6 +2,7 @@ package com.andre.rinha.http;
 
 import com.andre.rinha.json.JsonReader;
 import com.andre.rinha.json.Payload;
+import com.andre.rinha.trace.Traces;
 import com.andre.rinha.vector.Dataset;
 import com.andre.rinha.vector.KnnSearcher;
 import com.andre.rinha.vector.Vectorizer;
@@ -10,6 +11,7 @@ import com.sun.net.httpserver.HttpHandler;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
 
 /**
  * POST /fraud-score — main endpoint.
@@ -30,8 +32,29 @@ import java.io.InputStream;
  *
  * Response: JSON bytes built by hand. Only two possible shapes, so a
  * simple StringBuilder is more than enough.
+ *
+ * Instrumentation: nanoTime() spans around each stage feed Traces. The
+ * five timestamps cost ~5×50ns ≈ 0.25µs per request — irrelevant against
+ * a ~1ms budget. Disable by stripping the trace calls if you ever need
+ * the absolute last microsecond.
  */
 public final class FraudHandler implements HttpHandler {
+
+    // Pre-built response bytes — KnnSearcher returns one of 6 scores
+    // (0.0, 0.2, 0.4, 0.6, 0.8, 1.0), each pairs with a single approved
+    // value (score < 0.6 ⇒ approved=true). So there are exactly 6 possible
+    // responses. Skip StringBuilder + String.toBytes per request.
+    private static final byte[][] RESPONSES = new byte[6][];
+
+    static {
+        for (int frauds = 0; frauds <= 5; frauds++) {
+            float score = frauds / 5f;
+            boolean approved = score < 0.6f;
+            String body = "{\"approved\":" + approved
+                        + ",\"fraud_score\":" + score + "}";
+            RESPONSES[frauds] = body.getBytes(StandardCharsets.UTF_8);
+        }
+    }
 
     private final Dataset dataset;
 
@@ -46,34 +69,42 @@ public final class FraudHandler implements HttpHandler {
 
     @Override
     public void handle(HttpExchange ex) throws IOException {
+        final long t0 = System.nanoTime();
         try {
             if (!"POST".equals(ex.getRequestMethod())) {
                 ex.sendResponseHeaders(405, -1);
                 return;
             }
 
-            // 1. Read the entire body.
             byte[] body = readAll(ex.getRequestBody());
+            final long tRead = System.nanoTime();
 
-            // 2. Parse.
             Payload p = JsonReader.parse(body);
+            final long tParse = System.nanoTime();
 
-            // 3. Vectorize.
             float[] q = queryTl.get();
             Vectorizer.vectorize(p, q);
+            final long tVec = System.nanoTime();
 
-            // 4. k-NN.
             float score = searcherTl.get().fraudScore(q);
-            boolean approved = score < 0.6f;
+            final long tKnn = System.nanoTime();
 
-            // 5. Response.
-            byte[] resp = buildResponse(approved, score);
+            // score = frauds/5, so frauds = round(score*5). Multiplication is
+            // exact for these denominators — no floating-point surprises.
+            int frauds = Math.round(score * 5f);
+            byte[] resp = RESPONSES[frauds];
             ex.getResponseHeaders().add("Content-Type", "application/json");
             ex.sendResponseHeaders(200, resp.length);
             ex.getResponseBody().write(resp);
+            final long tEnd = System.nanoTime();
+
+            Traces.recordNs(Traces.Span.READ,  tRead  - t0);
+            Traces.recordNs(Traces.Span.PARSE, tParse - tRead);
+            Traces.recordNs(Traces.Span.VEC,   tVec   - tParse);
+            Traces.recordNs(Traces.Span.KNN,   tKnn   - tVec);
+            Traces.recordNs(Traces.Span.RESP,  tEnd   - tKnn);
+            Traces.recordNs(Traces.Span.TOTAL, tEnd   - t0);
         } catch (Exception e) {
-            // Minimal logging — in production we'd need to know, but without
-            // bloating the response.
             System.err.println("[fraud] error: " + e.getMessage());
             try {
                 ex.sendResponseHeaders(500, -1);
@@ -84,21 +115,6 @@ public final class FraudHandler implements HttpHandler {
     }
 
     private static byte[] readAll(InputStream is) throws IOException {
-        // Typical body ~500 bytes. 2KB is more than enough as initial capacity.
         return is.readAllBytes();
-    }
-
-    /**
-     * Builds {"approved":true,"fraud_score":0.0}.
-     *
-     * Using Float.toString for the score: acceptable for the 0.0/0.2/0.4/0.6/0.8/1.0
-     * range produced by the 0..5 / 5 dividend.
-     */
-    private static byte[] buildResponse(boolean approved, float score) {
-        StringBuilder sb = new StringBuilder(40);
-        sb.append("{\"approved\":").append(approved)
-          .append(",\"fraud_score\":").append(score)
-          .append('}');
-        return sb.toString().getBytes();
     }
 }

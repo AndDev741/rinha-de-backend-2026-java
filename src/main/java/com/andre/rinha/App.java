@@ -2,6 +2,7 @@ package com.andre.rinha;
 
 import com.andre.rinha.http.FraudHandler;
 import com.andre.rinha.http.ReadyHandler;
+import com.andre.rinha.http.StatsHandler;
 import com.andre.rinha.vector.Dataset;
 import com.andre.rinha.vector.KnnSearcher;
 import com.sun.net.httpserver.HttpServer;
@@ -46,6 +47,7 @@ public final class App {
         HttpServer server = HttpServer.create(new InetSocketAddress(port), 4096);
         server.createContext("/ready", new ReadyHandler());
         server.createContext("/fraud-score", new FraudHandler(dataset));
+        server.createContext("/stats", new StatsHandler());
         // v7.1 (virtual threads) hit -6000 on rinha because every request
         // competed for the same 0.45 CPU, dragging p99 to the 2001 ms k6
         // timeout. v7.2 reverts to a small fixed pool: bounded concurrency

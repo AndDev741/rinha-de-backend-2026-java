@@ -1,6 +1,5 @@
 package com.andre.rinha.json;
 
-import java.time.Instant;
 import java.util.ArrayList;
 
 /**
@@ -79,7 +78,7 @@ public final class JsonReader {
                         switch (k) {
                             case "amount" -> txAmount = readDouble();
                             case "installments" -> txInstallments = (int) readLong();
-                            case "requested_at" -> txRequestedAt = parseIsoToEpoch(readString());
+                            case "requested_at" -> txRequestedAt = readIsoEpochSeconds();
                             default -> skipValue();
                         }
                         skipCommaOrEnd();
@@ -143,7 +142,7 @@ public final class JsonReader {
                             String k = readString();
                             skipWs(); expect((byte) ':'); skipWs();
                             switch (k) {
-                                case "timestamp" -> lastTxTimestamp = parseIsoToEpoch(readString());
+                                case "timestamp" -> lastTxTimestamp = readIsoEpochSeconds();
                                 case "km_from_current" -> lastTxKmFromCurrent = readDouble();
                                 default -> skipValue();
                             }
@@ -332,11 +331,53 @@ public final class JsonReader {
     }
 
     /**
-     * Parses an ISO-8601 timestamp ("2026-03-11T20:23:35Z") to epoch seconds.
-     * We use Instant.parse — allocation is unavoidable, but the call is rare
-     * (2 per request) and the JDK has an internal fast path.
+     * Parses an ISO-8601 timestamp ("2026-03-11T20:23:35Z") directly from
+     * the underlying byte buffer into epoch seconds. No String allocation,
+     * no Instant allocation — the two we'd otherwise pay per request.
+     *
+     * Format is strict: YYYY-MM-DDTHH:MM:SSZ (20 bytes). Fractional seconds
+     * are not expected in this dataset and would fall through to the
+     * trailing 'Z' / quote handling, which raises IllegalStateException.
      */
-    private static long parseIsoToEpoch(String iso) {
-        return Instant.parse(iso).getEpochSecond();
+    private long readIsoEpochSeconds() {
+        expect((byte) '"');
+        int s = pos;
+        int year  = digit4(s);
+        int month = digit2(s + 5);
+        int day   = digit2(s + 8);
+        int hour  = digit2(s + 11);
+        int min   = digit2(s + 14);
+        int sec   = digit2(s + 17);
+        pos = s + 19;
+        // Tolerate trailing 'Z' and the closing quote.
+        if (buf[pos] == (byte) 'Z') pos++;
+        expect((byte) '"');
+        long days = daysFromCivil(year, month, day);
+        return days * 86_400L + hour * 3_600L + min * 60L + sec;
+    }
+
+    private int digit4(int p) {
+        return (buf[p]     - '0') * 1000
+             + (buf[p + 1] - '0') * 100
+             + (buf[p + 2] - '0') * 10
+             + (buf[p + 3] - '0');
+    }
+
+    private int digit2(int p) {
+        return (buf[p] - '0') * 10 + (buf[p + 1] - '0');
+    }
+
+    /**
+     * Days from 1970-01-01 (epoch) for a proleptic Gregorian (y, m, d).
+     * Howard Hinnant's algorithm — correct for any plausible date, handles
+     * leap years and centuries without lookup tables. Returns a signed long.
+     */
+    private static long daysFromCivil(int y, int m, int d) {
+        y -= m <= 2 ? 1 : 0;
+        long era = (y >= 0 ? y : y - 399) / 400;
+        int yoe = (int) (y - era * 400);
+        int doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+        int doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        return era * 146_097L + doe - 719_468L;
     }
 }
