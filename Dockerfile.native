@@ -68,9 +68,11 @@ WORKDIR /app
 COPY --from=native-build /app/rinha-fraud /app/app
 COPY --from=jar-build    /app/data        /data
 
+# CONCURRENCY = microhttp connection event-loop threads. One non-blocking loop
+# is ideal on the rinha 0.45 CPU budget; more threads only contend for the core.
 ENV PORT=9999 \
     DATA_DIR=/data \
-    WORKERS=2
+    CONCURRENCY=1
 
 EXPOSE 9999
 

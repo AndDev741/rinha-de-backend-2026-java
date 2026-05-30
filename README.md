@@ -14,8 +14,9 @@ voting on the fraud labels.
 The whole thing runs inside the challenge's hard limits: **1 vCPU and 350 MB
 of memory split across 2 API instances and 1 load balancer**.
 
-No Spring, no Jackson, no Helidon. JDK 25, the built-in `HttpServer`, a
-hand-rolled JSON parser, and a from-scratch IVF k-NN with bounding-box
+No Spring, no Jackson, no Helidon. JDK 25, a single-threaded non-blocking NIO
+HTTP server ([microhttp](https://github.com/ebarlas/microhttp), ~500 LOC, zero
+deps), a hand-rolled JSON parser, and a from-scratch IVF k-NN with bounding-box
 pruning. ~1500 lines of Java total.
 
 ### Score under rinha rules
@@ -80,25 +81,6 @@ The `submission` branch ships a `docker-compose.yml` that pulls the
 pre-built `anddev741/rinha-fraud-java:v8.1` image from Docker Hub, so the
 rinha test engine doesn't have to rebuild.
 
-#### Local instrumentation harness
-
-```bash
-# Fires k6 → coleta /stats de api-1 + api-2 → nginx timing log → tabela markdown
-./scripts/run-instrumented.sh
-
-# Saída em test/instrument/. Analyzer combina histogramas dos 2 backends.
-python3 scripts/analyze.py
-```
-
-Per-span endpoints exposed by each backend:
-
-| Path | What it returns |
-|---|---|
-| `GET /stats/api-1`, `GET /stats/api-2` | JSON with 31-bucket histogram per span (READ, PARSE, VEC, KNN, RESP, TOTAL) |
-| `POST /stats/api-1/reset`, `POST /stats/api-2/reset` | Zero counters between test phases |
-
----
-
 ### How the search works
 
 The algorithm is **IVF (Inverted File) with bounding-box repair**.
@@ -140,10 +122,13 @@ behaves like a small fraction of brute force.
 
 #### Why no Spring / Helidon / Netty?
 
-The challenge runs on 1 vCPU. The bottleneck is the k-NN, not the HTTP
-parsing. `com.sun.net.httpserver.HttpServer` ships with the JDK, sets up in
-five lines, and handles thread-per-request with an `ExecutorService`. Adding
-a framework buys nothing here and costs RSS.
+The challenge runs on 1 vCPU. A full framework buys nothing here and costs RSS.
+v1–v8.1 used the JDK's `com.sun.net.httpserver`, but its thread-per-request model
+contends with itself on the 0.45 CPU each container gets, inflating the p99 tail.
+v9 switched to microhttp — a ~500-line single-threaded non-blocking NIO event
+loop (still not a framework, still zero heavy deps): one event-loop thread runs
+flat-out with no self-contention, which is exactly what a fractional CPU wants.
+Netty or Vert.x would add the same thread contention plus a far larger surface.
 
 #### Why a hand-rolled JSON parser?
 
@@ -207,25 +192,16 @@ indirection and (for PriorityQueue) object allocation.
 
 ```
 rinha-de-backend-andre-java/
-├── pom.xml                              Maven, Java 25, zero runtime deps
-├── Dockerfile                           Multi-stage Maven → JRE 25 (v7 era)
-├── Dockerfile.native                    Multi-stage Maven → GraalVM native (v8+)
+├── pom.xml                              Maven, Java 25, microhttp + shade uberjar
+├── Dockerfile                           Multi-stage Maven → JRE 25
+├── Dockerfile.native                    Multi-stage Maven → GraalVM native
 ├── docker-compose.yml                   nginx + 2× api, cgroup limits (JVM)
 ├── docker-compose.native.yaml           Same stack, native image
-├── nginx.conf                           Round-robin LB + per-request timing log
-├── scripts/
-│   ├── load-test.js                     k6 RATE-configurable workload
-│   ├── run-instrumented.sh              build → up → load → /stats → analyze
-│   ├── analyze.py                       Histograms per span + nginx delta table
-│   └── collect-profile.sh               Old PGO harness (kept for reference)
+├── nginx.conf                           Round-robin LB, keepalive to upstream
 ├── src/main/java/com/andre/rinha/
 │   ├── App.java                         Entry point: load → preTouch → warmup → start
 │   ├── http/
-│   │   ├── ReadyHandler.java            GET /ready
-│   │   ├── FraudHandler.java            POST /fraud-score (with nanoTime spans)
-│   │   └── StatsHandler.java            GET /stats: per-span histograms as JSON
-│   ├── trace/
-│   │   └── Traces.java                  Lock-free 31-bucket log-spaced histograms
+│   │   └── MicrohttpServer.java         microhttp NIO event loop: /ready + /fraud-score
 │   ├── json/
 │   │   ├── Payload.java                 Immutable record
 │   │   └── JsonReader.java              Hand-rolled cursor parser, ISO parser inline
@@ -393,9 +369,10 @@ vetores e votando nas labels de fraude.
 Tudo corre dentro dos limites do desafio: **1 vCPU e 350 MB de memória
 distribuídos entre 2 instâncias da API e 1 load balancer**.
 
-Sem Spring, sem Jackson, sem Helidon. JDK 25, o `HttpServer` que vem na
-JDK, um parser JSON escrito à mão, e um k-NN IVF com poda por bounding box
-escrito do zero. ~1500 linhas de Java no total.
+Sem Spring, sem Jackson, sem Helidon. JDK 25, um servidor HTTP NIO de thread
+única não-bloqueante ([microhttp](https://github.com/ebarlas/microhttp), ~500
+LOC, zero deps), um parser JSON escrito à mão, e um k-NN IVF com poda por
+bounding box escrito do zero. ~1500 linhas de Java no total.
 
 ### Score nas regras da rinha
 
@@ -460,25 +437,6 @@ A branch `submission` traz um `docker-compose.yml` que faz pull da imagem
 `anddev741/rinha-fraud-java:v8.1` do Docker Hub, para que o motor de teste
 da rinha não precise de rebuild.
 
-#### Harness de instrumentação local
-
-```bash
-# Dispara k6 → coleta /stats de api-1 + api-2 → log de timing do nginx → tabela
-./scripts/run-instrumented.sh
-
-# Output em test/instrument/. O analyzer combina histogramas dos 2 backends.
-python3 scripts/analyze.py
-```
-
-Endpoints expostos por cada backend:
-
-| Path | O que devolve |
-|---|---|
-| `GET /stats/api-1`, `GET /stats/api-2` | JSON com histograma de 31 buckets por span (READ, PARSE, VEC, KNN, RESP, TOTAL) |
-| `POST /stats/api-1/reset`, `POST /stats/api-2/reset` | Zera os contadores entre fases de teste |
-
----
-
 ### Como a busca funciona
 
 O algoritmo é **IVF (Inverted File) com reparo por bounding box**.
@@ -520,10 +478,14 @@ comporta-se como uma pequena fração do brute force.
 
 #### Por que não Spring / Helidon / Netty?
 
-O desafio corre em 1 vCPU. O gargalo é o k-NN, não o parsing HTTP. O
-`com.sun.net.httpserver.HttpServer` vem na JDK, sobe em cinco linhas, e
-trata thread-per-request com um `ExecutorService`. Adicionar um framework
-não compra nada aqui e custa RSS.
+O desafio corre em 1 vCPU. Um framework completo não compra nada aqui e custa
+RSS. As v1–v8.1 usaram o `com.sun.net.httpserver` da JDK, mas o modelo
+thread-per-request dele disputa consigo mesmo nos 0.45 CPU de cada container,
+inflando o tail do p99. A v9 trocou para o microhttp — um event loop NIO de
+thread única não-bloqueante de ~500 linhas (ainda não é framework, ainda zero
+deps pesadas): uma thread de loop roda a todo vapor sem auto-disputa, que é
+exatamente o que uma CPU fracionária quer. Netty ou Vert.x adicionariam a mesma
+disputa de threads mais uma superfície bem maior.
 
 #### Por que parser JSON escrito à mão?
 
@@ -587,25 +549,16 @@ mas adicionam indirecção e (para a PriorityQueue) alocação de objectos.
 
 ```
 rinha-de-backend-andre-java/
-├── pom.xml                              Maven, Java 25, zero deps de runtime
-├── Dockerfile                           Multi-stage Maven → JRE 25 (era v7)
-├── Dockerfile.native                    Multi-stage Maven → GraalVM native (v8+)
+├── pom.xml                              Maven, Java 25, microhttp + shade uberjar
+├── Dockerfile                           Multi-stage Maven → JRE 25
+├── Dockerfile.native                    Multi-stage Maven → GraalVM native
 ├── docker-compose.yml                   nginx + 2× api, limites cgroup (JVM)
 ├── docker-compose.native.yaml           Mesmo stack, imagem native
-├── nginx.conf                           LB round-robin + timing log por pedido
-├── scripts/
-│   ├── load-test.js                     k6 com RATE configurável
-│   ├── run-instrumented.sh              build → up → load → /stats → analyze
-│   ├── analyze.py                       Histogramas por span + delta nginx
-│   └── collect-profile.sh               Harness antigo de PGO (referência)
+├── nginx.conf                           LB round-robin, keepalive ao upstream
 ├── src/main/java/com/andre/rinha/
 │   ├── App.java                         Entry: load → preTouch → warmup → start
 │   ├── http/
-│   │   ├── ReadyHandler.java            GET /ready
-│   │   ├── FraudHandler.java            POST /fraud-score (com spans nanoTime)
-│   │   └── StatsHandler.java            GET /stats: histogramas por span em JSON
-│   ├── trace/
-│   │   └── Traces.java                  Histogramas lock-free de 31 buckets
+│   │   └── MicrohttpServer.java         Event loop NIO microhttp: /ready + /fraud-score
 │   ├── json/
 │   │   ├── Payload.java                 Record imutável
 │   │   └── JsonReader.java              Parser cursor manual, ISO inline

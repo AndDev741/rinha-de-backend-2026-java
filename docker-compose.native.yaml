@@ -9,7 +9,9 @@ services:
     environment:
       PORT: 9999
       DATA_DIR: /data
-      WORKERS: 2
+      # microhttp connection event-loop threads. One non-blocking loop is ideal
+      # on the rinha 0.45 CPU budget; more threads only contend for the core.
+      CONCURRENCY: 1
     deploy:
       resources:
         limits:
