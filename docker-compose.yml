@@ -19,13 +19,14 @@
 
 services:
   api-1: &api
-    image: anddev741/rinha-fraud-java:v8.1
+    image: anddev741/rinha-fraud-java:v9-microhttp
     networks:
       - rinha-net
     environment:
       PORT: 9999
       DATA_DIR: /data
-      WORKERS: 2
+      # microhttp event-loop threads; one non-blocking loop suits 0.45 CPU.
+      CONCURRENCY: 1
     deploy:
       resources:
         limits:
