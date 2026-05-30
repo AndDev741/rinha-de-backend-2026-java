@@ -1,30 +1,27 @@
 package com.andre.rinha;
 
-import com.andre.rinha.http.FraudHandler;
 import com.andre.rinha.http.MicrohttpServer;
-import com.andre.rinha.http.ReadyHandler;
-import com.andre.rinha.http.StatsHandler;
 import com.andre.rinha.vector.Dataset;
 import com.andre.rinha.vector.KnnSearcher;
-import com.sun.net.httpserver.HttpServer;
 
-import java.net.InetSocketAddress;
 import java.nio.file.Path;
 import java.util.Random;
-import java.util.concurrent.Executors;
 
 /**
- * Entry point — v7 (int16 IVF with bbox repair).
+ * Entry point — v9 (int16 IVF with bbox repair, microhttp NIO event loop).
  *
  * Environment variables:
- *   PORT      — HTTP port (default 9999, as required by the challenge)
- *   DATA_DIR  — directory with vectors-i16.bin, centroids-i16.bin, bbox.bin,
- *               cluster_offsets.bin, labels.bin (default ./data)
+ *   PORT         — HTTP port (default 9999, as required by the challenge)
+ *   DATA_DIR     — directory with vectors-i16.bin, centroids-i16.bin, bbox.bin,
+ *                  cluster_offsets.bin, labels.bin (default ./data)
+ *   CONCURRENCY  — microhttp connection event-loop threads (default 1; a single
+ *                  non-blocking loop is ideal on the rinha 0.45 CPU budget)
  *
  * Initialization order:
  *   1. Load the int16 IVF dataset (~84 MB heap).
- *   2. JIT warmup over the hot path.
- *   3. Bind and start. /ready only responds once we reach this point.
+ *   2. Pre-touch the dataset pages so the first request never page-faults.
+ *   3. Warm the search hot path against real-shape queries.
+ *   4. Start the microhttp event loop. /ready only answers once we reach here.
  */
 public final class App {
 
@@ -45,39 +42,19 @@ public final class App {
         preTouch(dataset);
         warmup(dataset);
 
-        // v9 spike: SERVER=microhttp swaps the JDK thread-per-request server for a
-        // single-threaded non-blocking NIO event loop. Same dataset/search/warmup;
-        // only the HTTP transport changes, so the rinha score isolates the win.
-        // Default stays "jdk" so the proven path is untouched unless opted in.
-        String serverKind = env("SERVER", "jdk");
-        if ("microhttp".equals(serverKind)) {
-            int concurrency = envInt("CONCURRENCY", 1);
-            MicrohttpServer.start(port, dataset, concurrency);
-            return; // microhttp's non-daemon event-loop threads keep the JVM alive
-        }
-
-        // Backlog of 4096 absorbs the rinha k6 ramp (peaks ~900 RPS).
-        HttpServer server = HttpServer.create(new InetSocketAddress(port), 4096);
-        server.createContext("/ready", new ReadyHandler());
-        server.createContext("/fraud-score", new FraudHandler(dataset));
-        server.createContext("/stats", new StatsHandler());
-        // v7.1 (virtual threads) hit -6000 on rinha because every request
-        // competed for the same 0.45 CPU, dragging p99 to the 2001 ms k6
-        // timeout. v7.2 reverts to a small fixed pool: bounded concurrency
-        // protects per-request latency, the accept backlog absorbs bursts.
-        int workers = envInt("WORKERS", 6);
-        server.setExecutor(Executors.newFixedThreadPool(workers));
-        server.start();
-
-        System.out.printf("[app] listening on :%d with %d worker threads%n", port, workers);
+        // Single-threaded non-blocking NIO event loop. On the rinha 0.45 CPU
+        // budget one event-loop thread runs flat-out with no self-contention,
+        // which keeps the p99 tail low under the k6 ramp.
+        int concurrency = envInt("CONCURRENCY", 1);
+        MicrohttpServer.start(port, dataset, concurrency);
     }
 
     /**
-     * Warm up the JIT against the real dataset. Random queries mostly bbox-
-     * prune to nothing, so they don't exercise the cluster-scan hot path
-     * that real fraud queries trigger. We sample 2000 dataset vectors as
-     * near-self queries: each one forces a full cluster scan plus bbox-
-     * repair against a few neighbours, which mirrors real traffic.
+     * Warm up the hot path against the real dataset. Random queries mostly bbox-
+     * prune to nothing, so they don't exercise the cluster-scan hot path that
+     * real fraud queries trigger. We sample 2000 dataset vectors as near-self
+     * queries: each one forces a full cluster scan plus bbox-repair against a
+     * few neighbours, which mirrors real traffic.
      */
     private static void warmup(Dataset ds) {
         var searcher = new KnnSearcher(ds);

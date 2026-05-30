@@ -32,15 +32,9 @@ services:
     environment:
       PORT: 9999
       DATA_DIR: /data
-      # v9 spike: single-threaded non-blocking NIO event loop (microhttp).
-      # Flip SERVER to "jdk" to A/B against the old com.sun.net.httpserver path.
-      SERVER: microhttp
+      # microhttp connection event-loop threads. One non-blocking loop is ideal
+      # on the rinha 0.45 CPU budget; more threads only contend for the core.
       CONCURRENCY: 1
-      # v7.3: 2 platform threads + 4096 accept backlog handle the rinha k6
-      # ramp (peaks ~900 RPS). Smaller pools are safer on the rinha runner's
-      # 0.45 CPU than virtual threads, which fanned out too eagerly in v7.1.
-      # (WORKERS only applies when SERVER=jdk.)
-      WORKERS: 2
       # 84 MB short[] dataset + ~44 MB working heap fits well inside 165 MB.
       JAVA_OPTS: "-Xmx128m -XX:+UseSerialGC"
     deploy:

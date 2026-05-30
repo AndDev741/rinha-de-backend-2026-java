@@ -9,10 +9,9 @@ services:
     environment:
       PORT: 9999
       DATA_DIR: /data
-      # v9 spike: single-threaded NIO event loop. Flip to "jdk" to A/B the old server.
-      SERVER: microhttp
+      # microhttp connection event-loop threads. One non-blocking loop is ideal
+      # on the rinha 0.45 CPU budget; more threads only contend for the core.
       CONCURRENCY: 1
-      WORKERS: 2
     deploy:
       resources:
         limits:

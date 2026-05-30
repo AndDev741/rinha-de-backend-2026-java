@@ -15,8 +15,8 @@ import java.nio.charset.StandardCharsets;
 import java.util.List;
 
 /**
- * v9 spike — POST /fraud-score served by a single-threaded, non-blocking NIO
- * event loop (microhttp) instead of the JDK {@code com.sun.net.httpserver}.
+ * v9 — POST /fraud-score served by a single-threaded, non-blocking NIO event
+ * loop (microhttp), replacing the JDK {@code com.sun.net.httpserver}.
  *
  * Why: the JDK server is thread-per-request and blocking. On the rinha box each
  * API gets 0.45 CPU, so a thread pool only contends with itself and the p99 tail
@@ -45,9 +45,9 @@ public final class MicrohttpServer {
     private static final String READY_URI = "/ready";
 
     /**
-     * Six pre-built responses, byte-identical to {@link FraudHandler}: KnnSearcher
-     * returns frauds in 0..5, score = frauds/5, approved = score < 0.6. Reusing the
-     * immutable {@link Response} records avoids allocating Response/Header per request.
+     * Six pre-built responses: KnnSearcher returns frauds in 0..5, score = frauds/5,
+     * approved = score < 0.6. Reusing the immutable {@link Response} records avoids
+     * allocating Response/Header per request.
      */
     private static final Response[] FRAUD_RESPONSES = new Response[6];
 

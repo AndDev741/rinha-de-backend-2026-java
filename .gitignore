@@ -11,3 +11,6 @@ test/instrument/
 
 # claude-code session state
 .claude/
+
+# code-intelligence tool artifact
+.understand-anything/

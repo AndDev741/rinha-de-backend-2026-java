@@ -46,14 +46,11 @@ WORKDIR /app
 COPY --from=build /app/target/rinha-fraud.jar app.jar
 COPY --from=build /app/data /data
 
-# v9: microhttp (single-threaded NIO event loop) is the default server on this
-# branch. CONCURRENCY=1 = one event-loop thread, ideal on 0.45 CPU. Set
-# SERVER=jdk to fall back to com.sun.net.httpserver (WORKERS applies then).
+# CONCURRENCY = microhttp connection event-loop threads. One non-blocking loop
+# is ideal on the rinha 0.45 CPU budget; more threads only contend for the core.
 ENV PORT=9999 \
     DATA_DIR=/data \
-    SERVER=microhttp \
     CONCURRENCY=1 \
-    WORKERS=2 \
     JAVA_OPTS="-Xmx128m -XX:+UseSerialGC"
 
 EXPOSE 9999
