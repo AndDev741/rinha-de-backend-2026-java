@@ -34,6 +34,10 @@ pruning. ~1500 lines of Java total.
 Image: `anddev741/rinha-fraud-java:v8.1` on Docker Hub.
 Submission commit: [`55d7c93`](../../tree/submission).
 
+> **`main` is now v9** (microhttp NIO event loop — see the journey below). The
+> score above is the last *confirmed* rinha result (v8.1); v9's own rinha number
+> is pending its preview run.
+
 The k-NN is exact: same top-5 as float32 brute force, but with most of the
 dataset never scanned. v8 moved compilation from JVM JIT to GraalVM
 `native-image`, killed per-request allocations on the parse / vectorize /
@@ -42,7 +46,7 @@ first request never page-faults. Under the rinha rules (1 vCPU, 350 MB,
 2 instances behind nginx) every answered request is classified correctly,
 and no requests time out.
 
-This repo is also a learning trail. Each branch (`v1` through `v8.1`) is
+This repo is also a learning trail. Each branch (`v1` through `v9`) is
 a working snapshot of one optimization, with measured scores. The journey
 includes documented regressions — v6 (Vector API + native-image),
 v7.1 (virtual threads), v8 (heap pinning + sort overhead). Each one
@@ -56,9 +60,9 @@ tells those stories.
 You need Docker, Docker Compose, and [k6](https://k6.io) for the load test.
 The dataset is built inside the image, so there is no Java step on the host.
 
-Two compose files are available:
-- `docker-compose.yml` — the **v7-era JVM stack** (`Dockerfile`)
-- `docker-compose.native.yaml` — the **v8.1 native-image stack**
+Two compose files are available (both run the v9 microhttp server):
+- `docker-compose.yml` — the **JVM stack** (`Dockerfile`)
+- `docker-compose.native.yaml` — the **native-image stack**
   (`Dockerfile.native`, ~6 min first build because `native-image` is slow)
 
 ```bash
@@ -220,7 +224,7 @@ rinha-de-backend-andre-java/
 
 ---
 
-### How we got here: v1 to v8.1
+### How we got here: v1 to v9
 
 Each branch is a self-contained snapshot. The Docker score column is the
 final number under rinha rules (1 vCPU + 350 MB).
@@ -239,6 +243,7 @@ final number under rinha rules (1 vCPU + 350 MB).
 | `v7.3` | 2 workers + realistic warmup | **+4049.51 (rinha)** | The combination unlocked it |
 | `v8` | GraalVM native + alloc-free hot path + heap pinning + sort | +2718.6 (rinha) | Pinning + sort regressed −1338 |
 | `v8.1` | Reverted sort + heap pinning, kept native + alloc-free + pre-touch | **+4056.85 (rinha)** | Recovered the ground |
+| `v9` | microhttp NIO event loop replaces JDK HttpServer; drop JDK path + instrumentation | _pending_ | Single-thread non-blocking loop; awaiting rinha number |
 
 Three stories from this list are worth telling.
 
@@ -306,6 +311,15 @@ catastrophes, not marginal wins; and never bundle multiple changes into
 one submission, because when something regresses you can't tell which
 piece did it.
 
+**v9 attacks the transport, not the search.** Comparing against the top-14
+jvmoonshot solution showed the detection was already identical (both score
++3000) — the entire gap was p99 latency. The JDK `com.sun.net.httpserver` runs
+thread-per-request and, on 0.45 CPU, contends with itself; the tail balloons
+under the k6 ramp. v9 swaps it for microhttp, a ~500-line single-threaded
+non-blocking NIO event loop, and removes the now-dead JDK path, the /stats
+instrumentation, and the PGO scripts (net −835 lines). Validated locally and
+under native-image; the rinha number is pending its preview run.
+
 For each branch's detailed numbers, the commit message has them.
 
 ---
@@ -347,9 +361,9 @@ Things worth trying. v9 priorities come from a deep read of
 - **KD-tree with BBF + epsilon-relaxation + refine-boundary**. Replaces
   the IVF + bbox-repair index. Probably 20-40 % faster on KNN; 2 000
   lines of code to port and tune.
-- **Custom NIO HTTP server**. Single thread, gathering write,
-  `selectNow()` keep-alive trick. Saves ~10-20 µs per request vs JDK
-  `HttpServer`.
+- **Custom NIO HTTP server** — _landed in v9 via microhttp_ (single-threaded
+  non-blocking event loop). A fully hand-rolled zero-alloc loop with the
+  `selectNow()` keep-alive trick could shave a few µs more.
 - **Rust load balancer with `SCM_RIGHTS` FD passing**. Replaces nginx
   data path. Saves ~50-100 µs per request.
 
@@ -389,6 +403,10 @@ bounding box escrito do zero. ~1500 linhas de Java no total.
 Imagem: `anddev741/rinha-fraud-java:v8.1` no Docker Hub.
 Commit da submissão: [`55d7c93`](../../tree/submission).
 
+> **A `main` agora é v9** (event loop NIO microhttp — ver a jornada abaixo). O
+> score acima é o último resultado *confirmado* na rinha (v8.1); o número da v9
+> ainda está pendente da prévia.
+
 O k-NN é exato: mesmo top-5 que brute force em float32, mas com a maioria
 do dataset nunca varrido. A v8 trocou compilação JVM por GraalVM
 `native-image`, eliminou alocações por pedido na pipeline parse / vectorize
@@ -398,7 +416,7 @@ que o primeiro pedido nunca pague page-fault. Sob as regras da rinha
 classificado correctamente, e nenhum dá timeout.
 
 Este repo também é um registo de aprendizagem. Cada branch (`v1` a
-`v8.1`) é um snapshot funcional de uma optimização, com scores medidos.
+`v9`) é um snapshot funcional de uma optimização, com scores medidos.
 A jornada inclui regressões documentadas — v6 (Vector API + native-image),
 v7.1 (virtual threads), v8 (heap pinning + overhead do sort). Cada uma
 ensinou algo concreto; a secção da jornada no fim deste README conta
@@ -411,9 +429,9 @@ essas histórias.
 Precisas de Docker, Docker Compose, e [k6](https://k6.io) para o teste de
 carga. O dataset é construído dentro da imagem, não há passo Java no host.
 
-Há dois compose files disponíveis:
-- `docker-compose.yml` — stack JVM da era v7 (`Dockerfile`)
-- `docker-compose.native.yaml` — stack native-image v8.1
+Há dois compose files disponíveis (ambos rodam o servidor microhttp da v9):
+- `docker-compose.yml` — stack JVM (`Dockerfile`)
+- `docker-compose.native.yaml` — stack native-image
   (`Dockerfile.native`, ~6 min de build na primeira vez)
 
 ```bash
@@ -577,7 +595,7 @@ rinha-de-backend-andre-java/
 
 ---
 
-### A jornada: v1 a v8.1
+### A jornada: v1 a v9
 
 Cada branch é um snapshot independente. A coluna Score é o número final
 sob as regras da rinha (1 vCPU + 350 MB).
@@ -596,6 +614,7 @@ sob as regras da rinha (1 vCPU + 350 MB).
 | `v7.3` | 2 workers + warmup realista | **+4049.51 (rinha)** | A combinação desbloqueou |
 | `v8` | GraalVM native + alloc-free + heap pinning + sort | +2718.6 (rinha) | Pinning + sort regrediram −1338 |
 | `v8.1` | Reverteu sort + heap pinning, manteve native + alloc-free + pre-touch | **+4056.85 (rinha)** | Recuperou o terreno |
+| `v9` | event loop NIO microhttp substitui o JDK HttpServer; remove path JDK + instrumentação | _pendente_ | Loop de thread única não-bloqueante; aguardando número da rinha |
 
 Três histórias desta lista vale a pena contar.
 
@@ -666,6 +685,15 @@ encontrar catástrofes, não para ganhos marginais; e nunca empacotar
 várias mudanças numa submissão, porque quando algo regride não consegues
 saber qual foi.
 
+**A v9 ataca o transporte, não a busca.** Comparar com a solução top-14 da
+jvmoonshot mostrou que a detecção já era idêntica (ambas +3000) — todo o gap
+era latência de p99. O `com.sun.net.httpserver` da JDK é thread-per-request e,
+em 0.45 CPU, disputa consigo mesmo; o tail dispara sob a rampa do k6. A v9 troca
+por microhttp, um event loop NIO de thread única não-bloqueante de ~500 linhas,
+e remove o path JDK morto, a instrumentação /stats e os scripts de PGO
+(−835 linhas líquidas). Validado localmente e sob native-image; o número da
+rinha está pendente da prévia.
+
 Para os números detalhados de cada branch, a mensagem de commit tem-nos
 todos.
 
@@ -709,9 +737,9 @@ da rinha JVM, p99 1.36 ms).
 - **KD-tree com BBF + epsilon-relaxation + refine-boundary**. Substitui o
   index IVF + bbox-repair. Provavelmente 20-40 % mais rápido no KNN; 2 000
   linhas de código para portar e afinar.
-- **Servidor NIO HTTP custom**. Thread única, gathering write, truque do
-  `selectNow()` em keep-alive. Poupa ~10-20 µs por pedido vs JDK
-  `HttpServer`.
+- **Servidor NIO HTTP custom** — _entregue na v9 via microhttp_ (event loop
+  de thread única não-bloqueante). Um loop totalmente artesanal zero-alloc com
+  o truque do `selectNow()` em keep-alive ainda pouparia uns µs.
 - **Load balancer em Rust com FD passing via `SCM_RIGHTS`**. Substitui o
   data path do nginx. Poupa ~50-100 µs por pedido.
 
