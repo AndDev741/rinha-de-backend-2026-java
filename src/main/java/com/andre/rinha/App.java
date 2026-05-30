@@ -1,6 +1,7 @@
 package com.andre.rinha;
 
 import com.andre.rinha.http.FraudHandler;
+import com.andre.rinha.http.MicrohttpServer;
 import com.andre.rinha.http.ReadyHandler;
 import com.andre.rinha.http.StatsHandler;
 import com.andre.rinha.vector.Dataset;
@@ -43,6 +44,17 @@ public final class App {
 
         preTouch(dataset);
         warmup(dataset);
+
+        // v9 spike: SERVER=microhttp swaps the JDK thread-per-request server for a
+        // single-threaded non-blocking NIO event loop. Same dataset/search/warmup;
+        // only the HTTP transport changes, so the rinha score isolates the win.
+        // Default stays "jdk" so the proven path is untouched unless opted in.
+        String serverKind = env("SERVER", "jdk");
+        if ("microhttp".equals(serverKind)) {
+            int concurrency = envInt("CONCURRENCY", 1);
+            MicrohttpServer.start(port, dataset, concurrency);
+            return; // microhttp's non-daemon event-loop threads keep the JVM alive
+        }
 
         // Backlog of 4096 absorbs the rinha k6 ramp (peaks ~900 RPS).
         HttpServer server = HttpServer.create(new InetSocketAddress(port), 4096);

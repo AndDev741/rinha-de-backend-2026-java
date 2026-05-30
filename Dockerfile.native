@@ -68,8 +68,13 @@ WORKDIR /app
 COPY --from=native-build /app/rinha-fraud /app/app
 COPY --from=jar-build    /app/data        /data
 
+# v9: microhttp (single-threaded non-blocking NIO event loop) is the default
+# server on this branch. CONCURRENCY=1 = one event-loop thread, ideal on 0.45 CPU.
+# Set SERVER=jdk to fall back to the com.sun.net.httpserver path for A/B testing.
 ENV PORT=9999 \
     DATA_DIR=/data \
+    SERVER=microhttp \
+    CONCURRENCY=1 \
     WORKERS=2
 
 EXPOSE 9999

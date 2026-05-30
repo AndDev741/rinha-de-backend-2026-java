@@ -9,6 +9,9 @@ services:
     environment:
       PORT: 9999
       DATA_DIR: /data
+      # v9 spike: single-threaded NIO event loop. Flip to "jdk" to A/B the old server.
+      SERVER: microhttp
+      CONCURRENCY: 1
       WORKERS: 2
     deploy:
       resources:
