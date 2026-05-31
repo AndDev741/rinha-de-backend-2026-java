@@ -19,16 +19,13 @@
 
 services:
   api-1: &api
-    image: anddev741/rinha-fraud-java:v9-microhttp
+    image: anddev741/rinha-fraud-java:v8.1
     networks:
       - rinha-net
     environment:
       PORT: 9999
       DATA_DIR: /data
-      # 2 event-loop threads (matches v8.1's 2 workers): a second thread overlaps
-      # the memory-latency stalls of the 84MB IVF scan on the Mac Mini's aged DRAM.
-      # C=1 serialized the searches and doubled p99 on the runner (139ms vs 72ms).
-      CONCURRENCY: 2
+      WORKERS: 2
     deploy:
       resources:
         limits:
