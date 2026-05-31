@@ -19,16 +19,13 @@
 
 services:
   api-1: &api
-    image: anddev741/rinha-fraud-java:v9-jvm
+    image: anddev741/rinha-fraud-java:v8.1
     networks:
       - rinha-net
     environment:
       PORT: 9999
       DATA_DIR: /data
-      # HotSpot JVM build (microhttp). Local: native ~40-80ms vs JVM ~15ms — the
-      # native-image -O3 hot loop loses to a warmed C2 JIT. CONCURRENCY=2 overlaps
-      # the memory-bound IVF scan (C=2 local sweet spot; C=3 over-threads).
-      CONCURRENCY: 2
+      WORKERS: 2
     deploy:
       resources:
         limits:
